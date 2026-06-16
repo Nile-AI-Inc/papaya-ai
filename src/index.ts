@@ -101,7 +101,7 @@ type TraceBatch = {
   batchId: string;
   sentAt: string;
   sdk: {
-    name: "@papaya-ai/ai";
+    name: "@papaya-ai/tracing";
     version: string;
     language: "typescript";
     runtime?: string;
@@ -455,7 +455,7 @@ export class Papaya {
       batchId: id("batch"),
       sentAt: iso(),
       sdk: {
-        name: "@papaya-ai/ai",
+        name: "@papaya-ai/tracing",
         version: SDK_VERSION,
         language: "typescript",
         runtime: `node/${process.version}`,

@@ -24,9 +24,9 @@ npm pack --dry-run
 When validating from the Supernova monorepo, run:
 
 ```sh
-npm run typecheck --workspace @papaya-ai/ai
-npm run test --workspace @papaya-ai/ai
-npm pack --workspace @papaya-ai/ai --dry-run
+npm run typecheck --workspace @papaya-ai/tracing
+npm run test --workspace @papaya-ai/tracing
+npm pack --workspace @papaya-ai/tracing --dry-run
 npm run test:papaya-ai-sdk-release
 ```
 
@@ -51,7 +51,7 @@ Attach these to the release notes:
 
 ## Publish
 
-Publish with npm provenance from the guarded GitHub Actions publish job after npm Trusted Publishing is configured for `@papaya-ai/ai`:
+Publish with npm provenance from the guarded GitHub Actions publish job after npm Trusted Publishing is configured for `@papaya-ai/tracing`:
 
 ```sh
 gh workflow run npm-publish.yml -f publish_npm=true

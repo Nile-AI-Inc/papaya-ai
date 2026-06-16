@@ -1,5 +1,5 @@
 {
-  "name": "@papaya-ai/ai",
+  "name": "@papaya-ai/tracing",
   "version": "0.1.0",
   "description": "Papaya AI agent trace capture SDK for production apps.",
   "license": "MIT",

@@ -1,0 +1,66 @@
+{
+  "name": "@papaya/ai",
+  "version": "0.1.0",
+  "description": "Papaya AI agent trace capture SDK for production apps.",
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://papaya.fyi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nile-AI-Inc/papaya-ai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Nile-AI-Inc/papaya-ai/issues"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "agentic",
+    "observability",
+    "tracing",
+    "llm",
+    "openai",
+    "anthropic",
+    "gemini",
+    "bedrock",
+    "vercel-ai-sdk"
+  ],
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "RELEASE.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "check:node": "node ./scripts/check-node-version.mjs",
+    "prebuild": "npm run check:node",
+    "prepack": "npm run build",
+    "pretest": "npm run check:node",
+    "test": "tsx test/sdk.test.ts",
+    "pretypecheck": "npm run check:node",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,296 @@
+import assert from "node:assert/strict";
+
+import { Papaya, type PapayaFetchInit } from "../src/index.js";
+
+type CapturedRequest = {
+  url: string;
+  init?: RequestInit;
+  body: Record<string, unknown>;
+};
+
+type ExportedTrace = {
+  workflowKey?: string;
+  sessionId?: string;
+  spans?: Array<{
+    name?: string;
+    status?: string;
+    inputPayload?: { value?: unknown; redactionState?: string; byteLength?: number };
+    outputPayload?: { value?: unknown };
+    modelRef?: { provider?: string; requested?: string; used?: string };
+    attributes?: { method?: string; sessionId?: string; metadata?: Record<string, unknown> };
+  }>;
+};
+
+class FakeOpenAI {
+  public readonly providerRequests: unknown[] = [];
+  public readonly chat = {
+    completions: {
+      create: async (request: unknown) => {
+        this.providerRequests.push(request);
+        return {
+          id: "completion-1",
+          model: "gpt-test-used",
+          choices: [{ message: { role: "assistant", content: "hello back" } }],
+          usage: {
+            input_tokens: 11,
+            output_tokens: 7,
+            total_tokens: 18,
+          },
+        };
+      },
+    },
+  };
+}
+
+const captured: CapturedRequest[] = [];
+const originalFetch = globalThis.fetch;
+
+globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const body = typeof init?.body === "string" ? JSON.parse(init.body) as Record<string, unknown> : {};
+  captured.push({ url: String(input), init, body });
+  return new Response(JSON.stringify({ accepted: 1, rejected: 0 }), {
+    status: 202,
+    headers: { "content-type": "application/json" },
+  });
+}) as typeof fetch;
+
+try {
+  const provider = new FakeOpenAI();
+  const papaya = Papaya.init({
+    apiKey: "papaya-test-token",
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+    project: "checkout",
+    environment: "test",
+    capture: "redacted",
+    metadata: { plan: "standard" },
+  });
+  const openai = papaya.openai(provider, {
+    workflowKey: "checkout",
+    metadata: { release: "sha-test", plan: "enterprise" },
+  });
+
+  await openai.chat.completions.create({
+    model: "gpt-test",
+    messages: [{ role: "user", content: "email ada@example.com token Bearer abc.secret.token" }],
+    authorization: "Bearer should-not-reach-papaya",
+    papaya: {
+      sessionId: "session-1",
+      userId: "user-1",
+      metadata: { claimId: "claim-1", plan: "enterprise-plus" },
+    },
+  });
+  const flushResult = await papaya.flush();
+
+  assert.equal(provider.providerRequests.length, 1);
+  const providerRequest = provider.providerRequests[0] as Record<string, unknown>;
+  assert.equal("papaya" in providerRequest, false);
+  assert.equal(providerRequest.authorization, "Bearer should-not-reach-papaya");
+
+  assert.equal(captured.length, 1);
+  assert.deepEqual(flushResult, {
+    status: "sent",
+    traceCount: 1,
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+    httpStatus: 202,
+    responseText: JSON.stringify({ accepted: 1, rejected: 0 }),
+  });
+  assert.equal(captured[0]?.url, "https://papaya.example/api/v1/ingest/traces");
+  assert.equal((captured[0]?.init?.headers as Record<string, string>).Authorization, "Bearer papaya-test-token");
+  const exported = JSON.stringify(captured[0]?.body);
+  assert.equal(exported.includes("ada@example.com"), false);
+  assert.equal(exported.includes("Bearer abc.secret.token"), false);
+  assert.equal(exported.includes("Bearer should-not-reach-papaya"), false);
+  assert.equal(exported.includes("[redacted-email]"), true);
+  assert.equal(exported.includes("Bearer [redacted-token]"), true);
+  assert.equal(exported.includes("[redacted-secret]"), true);
+  assert.equal(exported.includes("enterprise-plus"), true);
+
+  const traces = captured[0]?.body.traces as Array<{ workflowKey?: string; sessionId?: string; spans?: Array<{ attributes?: Record<string, unknown>; usage?: Record<string, unknown> }> }>;
+  assert.equal(traces.length, 1);
+  assert.equal(traces[0]?.workflowKey, "checkout");
+  assert.equal(traces[0]?.sessionId, "session-1");
+  const llmSpan = traces[0]?.spans?.find((span) => span.attributes?.method === "chat.completions.create");
+  assert.ok(llmSpan);
+  assert.equal(llmSpan.usage?.inputTokens, 11);
+  assert.equal(llmSpan.attributes?.sessionId, "session-1");
+  assert.deepEqual(llmSpan.attributes?.metadata, {
+    plan: "enterprise-plus",
+    release: "sha-test",
+    claimId: "claim-1",
+  });
+
+  const metadataProvider = new FakeOpenAI();
+  const metadataPapaya = Papaya.init({
+    apiKey: "papaya-test-token",
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+    capture: "metadata",
+  });
+  const metadataOpenai = metadataPapaya.openai(metadataProvider);
+  await metadataOpenai.chat.completions.create({
+    model: "gpt-test",
+    messages: [{ role: "user", content: "metadata-only secret" }],
+  });
+  await metadataPapaya.flush();
+
+  const metadataBody = captured[1]?.body;
+  assert.ok(metadataBody);
+  const metadataText = JSON.stringify(metadataBody);
+  assert.equal(metadataText.includes("metadata-only secret"), false);
+  assert.equal(metadataText.includes("\"byteLength\""), true);
+  assert.equal(metadataText.includes("\"redactionState\":\"metadata\""), true);
+
+  const missingKeyPapaya = Papaya.init({
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+  });
+  const missingKeyOpenai = missingKeyPapaya.openai(new FakeOpenAI());
+  await missingKeyOpenai.chat.completions.create({
+    model: "gpt-test",
+    messages: [{ role: "user", content: "hello" }],
+  });
+  const missingKeyFlush = await missingKeyPapaya.flush();
+  assert.deepEqual(missingKeyFlush, {
+    status: "skipped",
+    traceCount: 1,
+    reason: "missing_api_key",
+  });
+
+  const providerFetchCalls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+  const providerResponses: Response[] = [];
+  const providerFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    providerFetchCalls.push({ input, init });
+    const url = String(input);
+    if (url.includes("generativelanguage.googleapis.com")) {
+      return new Response("temporary model outage", {
+        status: 503,
+        headers: { "content-type": "text/plain" },
+      });
+    }
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: ok\n\n"));
+        controller.close();
+      },
+    }), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    providerResponses.push(response);
+    return response;
+  }) as typeof fetch;
+
+  const fetchPapaya = Papaya.init({
+    apiKey: "papaya-test-token",
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+    capture: "redacted",
+    metadata: { workspaceDefault: true },
+  });
+  const llmFetch = fetchPapaya.fetch(providerFetch, {
+    workflowKey: "custom_agent_loop",
+    metadata: { release: "sha-fetch" },
+  });
+
+  const streamedResponse = await fetchPapaya.run({
+    workflowKey: "customer_support_agent",
+    workflowLabel: "Customer support agent",
+    sessionId: "fetch-session",
+    metadata: { route: "/api/agent", stage: "run" },
+  }, async () => {
+    const firstAttempt = await llmFetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-goog-api-key": "gemini-provider-secret",
+      },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: "please help ada@example.com" }] }],
+      }),
+      papaya: {
+        provider: "gemini",
+        model: "gemini-3.5-flash",
+        spanName: "gemini.chat",
+        metadata: { attempt: 1 },
+      },
+    } satisfies PapayaFetchInit);
+    assert.equal(firstAttempt.ok, false);
+
+    return llmFetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer openai-provider-secret",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-fetch",
+        messages: [{ role: "user", content: "email fetch@example.com token Bearer provider.secret.token" }],
+      }),
+      papaya: {
+        provider: "openai",
+        spanName: "openai.chat",
+        metadata: { attempt: 2, route: "provider" },
+      },
+    } satisfies PapayaFetchInit);
+  });
+  assert.equal(streamedResponse, providerResponses[0]);
+
+  const fetchFlush = await fetchPapaya.flush();
+  assert.equal(fetchFlush.status, "sent");
+  assert.equal(fetchFlush.traceCount, 1);
+  assert.equal(providerFetchCalls.length, 2);
+  assert.equal("papaya" in (providerFetchCalls[0]?.init as Record<string, unknown>), false);
+  assert.equal("papaya" in (providerFetchCalls[1]?.init as Record<string, unknown>), false);
+
+  const fetchBody = captured.at(-1)?.body;
+  assert.ok(fetchBody);
+  const fetchExport = JSON.stringify(fetchBody);
+  assert.equal(fetchExport.includes("gemini-provider-secret"), false);
+  assert.equal(fetchExport.includes("openai-provider-secret"), false);
+  assert.equal(fetchExport.includes("provider.secret.token"), false);
+  assert.equal(fetchExport.includes("fetch@example.com"), false);
+  assert.equal(fetchExport.includes("[redacted-email]"), true);
+  assert.equal(fetchExport.includes("text/event-stream"), true);
+
+  const fetchTrace = (fetchBody.traces as ExportedTrace[])[0];
+  assert.equal(fetchTrace?.workflowKey, "customer_support_agent");
+  assert.equal(fetchTrace?.sessionId, "fetch-session");
+  const geminiSpan = fetchTrace?.spans?.find((span) => span.name === "gemini.chat");
+  const openaiSpan = fetchTrace?.spans?.find((span) => span.name === "openai.chat");
+  assert.ok(geminiSpan);
+  assert.ok(openaiSpan);
+  assert.equal(geminiSpan.status, "failed");
+  assert.equal(geminiSpan.modelRef?.requested, "gemini-3.5-flash");
+  assert.equal(openaiSpan.status, "success");
+  assert.equal(openaiSpan.modelRef?.requested, "gpt-fetch");
+  assert.deepEqual(openaiSpan.attributes?.metadata, {
+    workspaceDefault: true,
+    release: "sha-fetch",
+    route: "provider",
+    stage: "run",
+    attempt: 2,
+  });
+  const openaiPayload = openaiSpan.inputPayload?.value as { headerNames?: string[]; body?: { messages?: Array<{ content?: string }> } };
+  assert.deepEqual(openaiPayload.headerNames, ["authorization", "content-type"]);
+  assert.equal(JSON.stringify(openaiPayload.body).includes("[redacted-email]"), true);
+
+  const implicitPapaya = Papaya.init({
+    apiKey: "papaya-test-token",
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+  });
+  const implicitFetch = implicitPapaya.fetch(providerFetch);
+  await implicitFetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({ model: "claude-fetch", messages: [] }),
+    papaya: { metadata: { attempt: 1 } },
+  } satisfies PapayaFetchInit);
+  const implicitFlush = await implicitPapaya.flush();
+  assert.equal(implicitFlush.status, "sent");
+  assert.equal(implicitFlush.traceCount, 1);
+  const implicitTrace = (captured.at(-1)?.body.traces as ExportedTrace[])[0];
+  assert.equal(implicitTrace?.workflowKey, "claude.fetch");
+  const implicitSpan = implicitTrace?.spans?.find((span) => span.name === "claude.fetch" && span.attributes?.method === "fetch");
+  assert.ok(implicitSpan);
+  assert.equal(implicitSpan.modelRef?.requested, "claude-fetch");
+
+  console.log("papaya-ai SDK tests passed");
+} finally {
+  globalThis.fetch = originalFetch;
+}

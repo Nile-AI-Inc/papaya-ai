@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_npm:
-        description: "Publish @papaya/ai to npm with provenance"
+        description: "Publish papaya-ai to npm with provenance"
         required: true
         type: boolean
         default: false

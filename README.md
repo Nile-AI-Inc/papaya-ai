@@ -1,13 +1,13 @@
 # Papaya AI SDK
 
-Trace production AI agents from TypeScript without putting Papaya in the model-provider request path. `papaya-ai` wraps your existing SDK client or `fetch` call, captures agent/LLM spans locally, redacts payloads by default, and exports traces to Papaya when you call `flush()`.
+Trace production AI agents from TypeScript without putting Papaya in the model-provider request path. `@papaya-ai/ai` wraps your existing SDK client or `fetch` call, captures agent/LLM spans locally, redacts payloads by default, and exports traces to Papaya when you call `flush()`.
 
 The package is intentionally provider-SDK-free. Keep using OpenAI, Anthropic/Claude, Gemini, Bedrock, Vercel AI SDK, or direct REST calls exactly as you do today.
 
 ## Install
 
 ```sh
-npm install papaya-ai
+npm install @papaya-ai/ai
 ```
 
 Set a Papaya ingest token for your service:
@@ -20,7 +20,7 @@ PAPAYA_API_KEY=papaya_...
 
 ```ts
 import OpenAI from "openai";
-import { Papaya } from "papaya-ai";
+import { Papaya } from "@papaya-ai/ai";
 
 const papaya = Papaya.init({
   apiKey: process.env.PAPAYA_API_KEY!,
@@ -41,7 +41,7 @@ await papaya.flush();
 Use `papaya.fetch()` when your agent loop calls providers directly. The wrapper calls the provider URL with your original request, strips the Papaya-only `papaya` field before the provider sees it, records header names instead of header values, and preserves streaming responses.
 
 ```ts
-import { Papaya, type PapayaFetchInit } from "papaya-ai";
+import { Papaya, type PapayaFetchInit } from "@papaya-ai/ai";
 
 const papaya = Papaya.init({
   apiKey: process.env.PAPAYA_API_KEY!,

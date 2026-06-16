@@ -17,6 +17,7 @@ type ExportedTrace = {
     inputPayload?: { value?: unknown; redactionState?: string; byteLength?: number };
     outputPayload?: { value?: unknown };
     modelRef?: { provider?: string; requested?: string; used?: string };
+    usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
     attributes?: { method?: string; sessionId?: string; metadata?: Record<string, unknown> };
   }>;
 };
@@ -289,6 +290,50 @@ try {
   const implicitSpan = implicitTrace?.spans?.find((span) => span.name === "claude.fetch" && span.attributes?.method === "fetch");
   assert.ok(implicitSpan);
   assert.equal(implicitSpan.modelRef?.requested, "claude-fetch");
+
+  const jsonProviderFetch = (async () =>
+    new Response(JSON.stringify({
+      id: "resp_1",
+      model: "gpt-fetch-json-used",
+      output_text: "I am the support assistant.",
+      usage: { input_tokens: 5, output_tokens: 6 },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+  const jsonPapaya = Papaya.init({
+    apiKey: "papaya-test-token",
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+    capture: "redacted",
+  });
+  const jsonFetch = jsonPapaya.fetch(jsonProviderFetch, {
+    workflowKey: "json_fetch_agent",
+  });
+  const jsonResponse = await jsonFetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-fetch-json",
+      input: [{ role: "user", content: "who are you?" }],
+    }),
+  });
+  assert.deepEqual(await jsonResponse.json(), {
+    id: "resp_1",
+    model: "gpt-fetch-json-used",
+    output_text: "I am the support assistant.",
+    usage: { input_tokens: 5, output_tokens: 6 },
+  });
+  const jsonFlush = await jsonPapaya.flush();
+  assert.equal(jsonFlush.status, "sent");
+  const jsonTrace = (captured.at(-1)?.body.traces as ExportedTrace[])[0];
+  const jsonSpan = jsonTrace?.spans?.find((span) => span.name === "openai.fetch");
+  assert.ok(jsonSpan);
+  const jsonOutput = jsonSpan.outputPayload?.value as { body?: { output_text?: string }; contentType?: string };
+  assert.equal(jsonOutput.contentType, "application/json");
+  assert.equal(jsonOutput.body?.output_text, "I am the support assistant.");
+  assert.equal(jsonSpan.usage?.inputTokens, 5);
+  assert.equal(jsonSpan.usage?.outputTokens, 6);
+  assert.equal(jsonSpan.usage?.totalTokens, 11);
 
   console.log("papaya-ai SDK tests passed");
 } finally {

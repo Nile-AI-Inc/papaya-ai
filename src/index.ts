@@ -101,7 +101,7 @@ type TraceBatch = {
   batchId: string;
   sentAt: string;
   sdk: {
-    name: "papaya-ai";
+    name: "@papaya-ai/ai";
     version: string;
     language: "typescript";
     runtime?: string;
@@ -178,17 +178,33 @@ const modelFromArgs = (args: unknown[]): string | undefined => {
   return undefined;
 };
 
+const recordValue = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+
+const usageRecordFrom = (result: unknown): Record<string, unknown> | undefined => {
+  const row = recordValue(result);
+  if (!row) return undefined;
+  const directUsage = recordValue(row.usage);
+  if (directUsage) return directUsage;
+  const directMetadata = recordValue(row.usageMetadata);
+  if (directMetadata) return directMetadata;
+  const body = recordValue(row.body);
+  return recordValue(body?.usage) ?? recordValue(body?.usageMetadata);
+};
+
 const usageFrom = (result: unknown): TraceSpan["usage"] | undefined => {
-  const usage = result && typeof result === "object" && "usage" in result ? (result as { usage?: Record<string, unknown> }).usage : undefined;
-  if (!usage || typeof usage !== "object") return undefined;
-  const inputTokens = numberValue(usage.input_tokens ?? usage.prompt_tokens ?? usage.inputTokens);
-  const outputTokens = numberValue(usage.output_tokens ?? usage.completion_tokens ?? usage.outputTokens);
+  const usage = usageRecordFrom(result);
+  if (!usage) return undefined;
+  const inputTokens = numberValue(usage.input_tokens ?? usage.prompt_tokens ?? usage.inputTokens ?? usage.promptTokenCount);
+  const outputTokens = numberValue(usage.output_tokens ?? usage.completion_tokens ?? usage.outputTokens ?? usage.candidatesTokenCount);
+  const cacheReadInputTokens = numberValue(usage.cache_read_input_tokens ?? usage.cached_input_tokens ?? usage.cacheReadInputTokens);
+  const cacheCreationInputTokens = numberValue(usage.cache_creation_input_tokens ?? usage.cacheCreationInputTokens);
   return {
     inputTokens,
     outputTokens,
-    totalTokens: numberValue(usage.total_tokens ?? usage.totalTokens) ?? (inputTokens ?? 0) + (outputTokens ?? 0),
-    cacheReadInputTokens: numberValue(usage.cache_read_input_tokens ?? usage.cached_input_tokens),
-    cacheCreationInputTokens: numberValue(usage.cache_creation_input_tokens),
+    totalTokens: numberValue(usage.total_tokens ?? usage.totalTokens ?? usage.totalTokenCount) ?? (inputTokens ?? 0) + (outputTokens ?? 0),
+    cacheReadInputTokens,
+    cacheCreationInputTokens,
     costUsd: numberValue(usage.cost_usd ?? usage.costUsd),
     pricingSource: usage.cost_usd || usage.costUsd ? "provider" : undefined,
   };
@@ -286,6 +302,59 @@ const captureableFetchBody = (body: BodyInit | null | undefined): unknown => {
     contentType: (body as { constructor?: { name?: string } }).constructor?.name ?? "BodyInit",
     note: "body was not read by Papaya",
   };
+};
+
+const MAX_FETCH_RESPONSE_CAPTURE_BYTES = 64 * 1024;
+const textLikeContentType = (contentType: string | null): boolean => {
+  const lower = contentType?.toLowerCase() ?? "";
+  return lower.includes("application/json") ||
+    lower.includes("+json") ||
+    lower.startsWith("text/") && !lower.includes("text/event-stream");
+};
+
+const parseResponseText = (contentType: string | null, text: string): unknown => {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  const lower = contentType?.toLowerCase() ?? "";
+  if (lower.includes("json")) {
+    try {
+      return JSON.parse(trimmed) as unknown;
+    } catch {
+      return text;
+    }
+  }
+  return text;
+};
+
+const captureableFetchResponse = async (response: Response): Promise<Record<string, unknown>> => {
+  const contentType = response.headers.get("content-type");
+  const contentLengthHeader = response.headers.get("content-length");
+  const contentLength = contentLengthHeader ? Number(contentLengthHeader) : undefined;
+  const base: Record<string, unknown> = {
+    status: response.status,
+    statusText: response.statusText,
+    contentType,
+  };
+
+  if (!textLikeContentType(contentType)) return base;
+  if (Number.isFinite(contentLength) && Number(contentLength) > MAX_FETCH_RESPONSE_CAPTURE_BYTES) {
+    return { ...base, bodyCapture: "skipped_large_response", contentLength };
+  }
+
+  try {
+    const text = await response.clone().text();
+    const encodedLength = new TextEncoder().encode(text).length;
+    if (encodedLength > MAX_FETCH_RESPONSE_CAPTURE_BYTES) {
+      return { ...base, bodyCapture: "skipped_large_response", contentLength: encodedLength };
+    }
+    return { ...base, body: parseResponseText(contentType, text) };
+  } catch (error) {
+    return {
+      ...base,
+      bodyCapture: "failed",
+      bodyCaptureError: error instanceof Error ? error.message : String(error),
+    };
+  }
 };
 
 const addHeaderNames = (names: Set<string>, headers: HeadersInit | undefined): void => {
@@ -386,7 +455,7 @@ export class Papaya {
       batchId: id("batch"),
       sentAt: iso(),
       sdk: {
-        name: "papaya-ai",
+        name: "@papaya-ai/ai",
         version: SDK_VERSION,
         language: "typescript",
         runtime: `node/${process.version}`,
@@ -550,11 +619,9 @@ export class Papaya {
       const response = await fetchImpl(input, init);
       span.endedAt = iso();
       span.status = response.ok ? "success" : "failed";
-      span.outputPayload = payload({
-        status: response.status,
-        statusText: response.statusText,
-        contentType: response.headers.get("content-type"),
-      }, this.options.capture);
+      const capturedResponse = await captureableFetchResponse(response);
+      span.outputPayload = payload(capturedResponse, this.options.capture);
+      span.usage = usageFrom(capturedResponse);
       span.modelRef = { ...span.modelRef, used: info.model };
       return response;
     } catch (error) {

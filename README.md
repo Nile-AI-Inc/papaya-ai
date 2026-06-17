@@ -14,6 +14,56 @@ Set a Papaya ingest token for your service:
 PAPAYA_API_KEY=papaya_...
 ```
 
+## AI IDE Prompt
+
+If you want your AI IDE to add tracing for you, paste this prompt:
+
+```text
+Add the @papaya-ai/tracing SDK to my existing project so my LLM calls show up as
+traces in Papaya. Keep the changes minimal. Do not refactor anything else.
+Reference: https://github.com/Nile-AI-Inc/papaya-ai
+
+1. Install:
+   npm i @papaya-ai/tracing
+
+2. Initialize once, in a shared module:
+
+   import { Papaya } from "@papaya-ai/tracing";
+
+   export const papaya = Papaya.init({
+     apiKey: process.env.PAPAYA_API_KEY,
+     project: "<my-project>",
+   });
+
+3. Apply one of these, matching how I call the model:
+
+   A. If I use a provider SDK, wrap the client once and keep calling it as before:
+
+      const openai = papaya.openai(new OpenAI());
+      await openai.chat.completions.create({ ... });
+
+      Use the matching wrapper if I use Anthropic/Claude, Bedrock, Gemini, or Vercel AI SDK.
+
+   B. If I call the model over raw HTTP, swap fetch for wrapped fetch:
+
+      const llmFetch = papaya.fetch(globalThis.fetch);
+      await llmFetch(url, { method, headers, body, papaya: { provider, model } });
+
+4. Make sure traces are sent even when my code fails:
+
+   try {
+     // ... my model calls ...
+   } finally {
+     await papaya.flush();
+   }
+
+   In a long-running server, flush on an interval and once more on shutdown.
+
+Find where I create my model client and where my request or job ends. Show me the
+exact lines to add for init, the wrapper, and the try/finally flush. Leave the
+rest of my code unchanged.
+```
+
 ## Quick Start
 
 ```ts

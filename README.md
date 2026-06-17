@@ -18,9 +18,9 @@ Set a Papaya ingest token for your service:
 PAPAYA_API_KEY=papaya_...
 ```
 
-## AI IDE Prompt
+## One-Prompt Setup
 
-If you want your AI IDE to add tracing for you, paste this prompt:
+Paste this prompt into your AI coding assistant (Claude Code, Cursor, Codex, …) and it will wire Papaya tracing into your app for you.
 
 ```text
 Add the @papaya-ai/tracing SDK to my existing project so my LLM and agent calls

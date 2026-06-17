@@ -23,49 +23,101 @@ PAPAYA_API_KEY=papaya_...
 If you want your AI IDE to add tracing for you, paste this prompt:
 
 ```text
-Add the @papaya-ai/tracing SDK to my existing project so my LLM calls show up as
-traces in Papaya. Keep the changes minimal. Do not refactor anything else.
+Add the @papaya-ai/tracing SDK to my existing project so my LLM and agent calls
+show up as traces in Papaya. Keep changes minimal. Do not refactor anything else.
 Reference: https://github.com/Nile-AI-Inc/papaya-ai
 
 1. Install:
    npm i @papaya-ai/tracing
 
-2. Initialize once, in a shared module:
+2. Initialize once, in a shared module. Set project/environment, and tie the
+   build to a version so regressions are attributable:
 
    import { Papaya } from "@papaya-ai/tracing";
 
    export const papaya = Papaya.init({
      apiKey: process.env.PAPAYA_API_KEY,
      project: "<my-project>",
+     environment: process.env.NODE_ENV ?? "development",
+     serviceName: "<my-service>",
+     serviceVersion: process.env.GIT_SHA,   // regression bisection
+     capture: "redacted",                    // metadata | redacted (default) | full
    });
 
-3. Apply one of these, matching how I call the model:
+3. Capture the model calls. Apply whichever matches how I call the model:
 
-   A. If I use a provider SDK, wrap the client once and keep calling it as before:
+   A. Provider SDK — wrap the client once, keep calling it as before:
+        const openai = papaya.openai(new OpenAI());
+        await openai.chat.completions.create({ ... });
+      Use the matching wrapper for Anthropic/Claude, Bedrock, Gemini, or the
+      Vercel AI SDK. Wrap EVERY model client I use, including secondary ones
+      (embeddings, rerankers, a cheap "router" model).
 
-      const openai = papaya.openai(new OpenAI());
-      await openai.chat.completions.create({ ... });
+   B. Raw HTTP — swap fetch for wrapped fetch and name the provider + model:
+        const llmFetch = papaya.fetch(globalThis.fetch);
+        await llmFetch(url, { method, headers, body,
+          papaya: { provider, model, spanName, metadata } });
 
-      Use the matching wrapper if I use Anthropic/Claude, Bedrock, Gemini, or Vercel AI SDK.
+4. Group multi-step work into ONE trace. Anything that makes more than a single
+   model call for one logical unit of work — an agent loop, a tool-use loop,
+   retries, a RAG pipeline, multiple providers — must be wrapped in papaya.run()
+   so the whole thing is one trace instead of N disconnected ones:
 
-   B. If I call the model over raw HTTP, swap fetch for wrapped fetch:
+   await papaya.run(
+     {
+       workflowKey: "<stable_machine_key>",     // e.g. "refund_agent"
+       workflowLabel: "<human label>",
+       sessionId,                                // group a user's turns
+       conversationId,                           // group a chat thread
+       userId, organizationId,                   // who/which tenant
+       conversational: true,                     // for chat UIs
+       metadata: { route: "/api/agent", requestId, tenant },
+     },
+     async () => { /* all the model + tool calls */ },
+   );
 
-      const llmFetch = papaya.fetch(globalThis.fetch);
-      await llmFetch(url, { method, headers, body, papaya: { provider, model } });
+   Pass per-call context on individual provider calls when it varies:
+     await openai.chat.completions.create({
+       model, messages,
+       papaya: { sessionId, userId, metadata: { step: "triage" } },
+     });
 
-4. Make sure traces are sent even when my code fails:
+5. Pass the real input each step. The SDK captures messages BY REFERENCE, so if I
+   mutate a running messages[] array in an agent loop, pass a copy per call
+   (e.g. messages: [...messages]) so each step freezes its actual input.
+
+6. Make traces survive failures. Failures are the most important thing to capture:
 
    try {
-     // ... my model calls ...
+     await handleRequest();
    } finally {
-     await papaya.flush();
+     await papaya.flush();          // always flush, even when my code throws
    }
 
-   In a long-running server, flush on an interval and once more on shutdown.
+   - In a long-running server, ALSO flush on an interval (e.g. every 5–10s) and
+     once more on shutdown (SIGTERM, SIGINT, beforeExit) so in-flight traces
+     aren't lost on deploy/restart.
+   - Papaya swallows its own export errors (set debug:true to log them) and never
+     changes my provider results, so the flush in finally is safe.
+   - A workflow that throws is still exported, marked failed/partial — keep the
+     model calls inside the run() so the failure is attached to the trace.
 
-Find where I create my model client and where my request or job ends. Show me the
-exact lines to add for init, the wrapper, and the try/finally flush. Leave the
-rest of my code unchanged.
+7. Watch-outs:
+   - Streaming: streamed responses are currently captured with limited
+     output/usage. If a call's output or token counts matter for analysis,
+     prefer a non-streaming variant there, or confirm streaming capture is
+     supported before relying on it.
+   - Never put secrets in the `papaya` metadata field (it IS exported); the SDK
+     records header NAMES only, not values, and strips the `papaya` field before
+     the provider sees the request.
+   - capture: "full" disables local redaction — only use it where policy allows.
+   - Large payloads: avoid attaching huge blobs as metadata; keep prompts/outputs
+     as the captured payload.
+
+Find where I create each model client, where each request/job begins and ends, and
+where my agent loop lives. Show me the exact lines to add for init, the wrappers,
+the run() boundary, and the try/finally + shutdown flush. Leave the rest of my code
+unchanged.
 ```
 
 ## Quick Start

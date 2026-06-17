@@ -1,8 +1,6 @@
 # Papaya AI SDK
 
-Trace production AI agents from TypeScript without putting Papaya in the model-provider request path. `@papaya-ai/tracing` wraps your existing SDK client or `fetch` call, captures agent/LLM spans locally, redacts payloads by default, and exports traces to Papaya when you call `flush()`.
-
-The package is intentionally provider-SDK-free. Keep using OpenAI, Anthropic/Claude, Gemini, Bedrock, Vercel AI SDK, or direct REST calls exactly as you do today.
+Papaya is a TypeScript tracing SDK for production AI agents. It wraps your existing OpenAI, Anthropic/Claude, Gemini, Bedrock, Vercel AI SDK, or `fetch` calls without proxying them. It captures traces locally, redacts payloads by default, and sends them when you call `flush()`.
 
 ## Install
 

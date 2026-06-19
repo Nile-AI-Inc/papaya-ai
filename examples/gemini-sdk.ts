@@ -2,18 +2,21 @@ import { Papaya } from "@papaya-ai/tracing";
 import { GoogleGenAI } from "@google/genai";
 
 const MODEL = "gemini-2.5-flash";
+const requireEnv = (name: string): string => {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required to run this real LLM example.`);
+  return value;
+};
 
 const papaya = Papaya.init({
-  // Key is inline so you can see exactly where it goes. In a real app use:
-  //   apiKey: process.env.PAPAYA_API_KEY
-  apiKey: "ppy_live_XXXXXXXXXXXXXXXXXXXX",
+  apiKey: requireEnv("PAPAYA_API_KEY"),
   project: "papaya-demo",
   environment: "demo",
   capture: "full",
 });
 
 // Wrap the Google GenAI client — every call is traced automatically.
-const gemini = papaya.gemini(new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }));
+const gemini = papaya.gemini(new GoogleGenAI({ apiKey: requireEnv("GEMINI_API_KEY") }));
 
 // Group the call(s) into one trace.
 const answer = await papaya.run(

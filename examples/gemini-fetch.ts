@@ -1,11 +1,14 @@
 import { Papaya, type PapayaFetchInit } from "@papaya-ai/tracing";
 
 const MODEL = "gemini-2.5-flash";
+const requireEnv = (name: string): string => {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required to run this real LLM example.`);
+  return value;
+};
 
 const papaya = Papaya.init({
-  // Key is inline so you can see exactly where it goes. In a real app use:
-  //   apiKey: process.env.PAPAYA_API_KEY
-  apiKey: "ppy_live_XXXXXXXXXXXXXXXXXXXX",
+  apiKey: requireEnv("PAPAYA_API_KEY"),
   project: "papaya-demo",
   environment: "demo",
   capture: "full",
@@ -21,7 +24,7 @@ const res = await llmFetch(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-goog-api-key": process.env.GEMINI_API_KEY!, // key lives in the header, never in the trace
+      "x-goog-api-key": requireEnv("GEMINI_API_KEY"), // key lives in the header, never in the trace
     },
     body: JSON.stringify({
       contents: [{ parts: [{ text: "In one sentence, what should I pack for a sunny day in London?" }] }],

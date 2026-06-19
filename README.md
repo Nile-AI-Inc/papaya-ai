@@ -1,10 +1,6 @@
 # Papaya AI SDK
 
-@papaya-ai/tracing is a lightweight TypeScript SDK that captures traces from your agentic workflows and sends them to Papaya for analysis.
-
-Papaya runs 200+ analyses on every trace and shows you exactly where your workflows can improve — prompts, context, tool calls, sub-agents, all of it.
-
-Integration takes just a few lines of instrumentation code, and the SDK adds no latency to your model calls. Keep using OpenAI, Anthropic/Claude, Gemini, Bedrock, Vercel AI SDK, or direct REST calls exactly as you do today.
+Papaya is a TypeScript tracing SDK for production AI agents. It wraps your existing OpenAI, Anthropic/Claude, Gemini, Bedrock, Vercel AI SDK, or `fetch` calls without proxying them. It captures traces locally, redacts payloads by default, and sends them when you call `flush()`.
 
 ## Install
 
@@ -15,109 +11,83 @@ npm install @papaya-ai/tracing
 Set a Papaya ingest token for your service:
 
 ```sh
-PAPAYA_API_KEY=papaya_...
+PAPAYA_API_KEY=ppy_live_...
 ```
 
-## One-Prompt Setup
+## AI IDE Prompt
 
-Paste this prompt into your AI coding assistant (Claude Code, Cursor, Codex, …) and it will wire Papaya tracing into your app for you.
+If you want your AI IDE to add tracing for you, paste this prompt:
 
 ```text
-Add the @papaya-ai/tracing SDK to my existing project so my LLM and agent calls
-show up as traces in Papaya. Keep changes minimal. Do not refactor anything else.
+Add the @papaya-ai/tracing SDK to my existing project so my LLM calls show up as
+traces in Papaya. Keep the changes minimal. Do not refactor anything else.
 Reference: https://github.com/Nile-AI-Inc/papaya-ai
 
 1. Install:
    npm i @papaya-ai/tracing
 
-2. Initialize once, in a shared module. Set project/environment, and tie the
-   build to a version so regressions are attributable:
+2. Initialize once, in a shared module:
 
    import { Papaya } from "@papaya-ai/tracing";
 
    export const papaya = Papaya.init({
      apiKey: process.env.PAPAYA_API_KEY,
      project: "<my-project>",
-     environment: process.env.NODE_ENV ?? "development",
-     serviceName: "<my-service>",
-     serviceVersion: process.env.GIT_SHA,   // regression bisection
-     capture: "redacted",                    // metadata | redacted (default) | full
    });
 
-3. Capture the model calls. Apply whichever matches how I call the model:
+3. Apply one of these, matching how I call the model:
 
-   A. Provider SDK — wrap the client once, keep calling it as before:
-        const openai = papaya.openai(new OpenAI());
-        await openai.chat.completions.create({ ... });
-      Use the matching wrapper for Anthropic/Claude, Bedrock, Gemini, or the
-      Vercel AI SDK. Wrap EVERY model client I use, including secondary ones
-      (embeddings, rerankers, a cheap "router" model).
+   A. If I use a provider SDK, wrap the client once and keep calling it as before:
 
-   B. Raw HTTP — swap fetch for wrapped fetch and name the provider + model:
-        const llmFetch = papaya.fetch(globalThis.fetch);
-        await llmFetch(url, { method, headers, body,
-          papaya: { provider, model, spanName, metadata } });
+      const openai = papaya.openai(new OpenAI());
+      await openai.chat.completions.create({ ... });
 
-4. Group multi-step work into ONE trace. Anything that makes more than a single
-   model call for one logical unit of work — an agent loop, a tool-use loop,
-   retries, a RAG pipeline, multiple providers — must be wrapped in papaya.run()
-   so the whole thing is one trace instead of N disconnected ones:
+      Use the matching wrapper if I use Anthropic/Claude, Bedrock, Gemini, or Vercel AI SDK.
 
-   await papaya.run(
-     {
-       workflowKey: "<stable_machine_key>",     // e.g. "refund_agent"
-       workflowLabel: "<human label>",
-       sessionId,                                // group a user's turns
-       conversationId,                           // group a chat thread
-       userId, organizationId,                   // who/which tenant
-       conversational: true,                     // for chat UIs
-       metadata: { route: "/api/agent", requestId, tenant },
-     },
-     async () => { /* all the model + tool calls */ },
-   );
+   B. If I call the model over raw HTTP, swap fetch for wrapped fetch:
 
-   Pass per-call context on individual provider calls when it varies:
-     await openai.chat.completions.create({
-       model, messages,
-       papaya: { sessionId, userId, metadata: { step: "triage" } },
-     });
+      const llmFetch = papaya.fetch(globalThis.fetch);
+      await llmFetch(url, { method, headers, body, papaya: { provider, model } });
 
-5. Pass the real input each step. The SDK captures messages BY REFERENCE, so if I
-   mutate a running messages[] array in an agent loop, pass a copy per call
-   (e.g. messages: [...messages]) so each step freezes its actual input.
+   C. If I use LangChain or LangGraph in TypeScript, use the callback handler:
 
-6. Make traces survive failures. Failures are the most important thing to capture:
+      import { PapayaCallbackHandler } from "@papaya-ai/tracing/langchain";
+
+      const callback = new PapayaCallbackHandler(papaya, { workflowKey, sessionId, userId });
+      await agent.invoke(input, { callbacks: [callback] });
+
+   D. If this is a Python app, use the Python SDK. For LangChain/LangGraph:
+
+      pip install "papaya-ai[langchain]"
+
+      import os
+      from papaya_ai import Papaya
+      from papaya_ai.integrations.langchain import PapayaCallbackHandler
+
+      papaya = Papaya.init(api_key=os.environ["PAPAYA_API_KEY"], project="<my-project>")
+      callback = PapayaCallbackHandler(papaya, workflow_key="<workflow>")
+      result = agent.invoke(input, config={"callbacks": [callback]})
+
+      For direct Python provider SDK calls, wrap the client once:
+
+      openai = papaya.openai(OpenAI())
+
+      Use one capture path for the same model call: callback handler for
+      LangChain/LangGraph trees, provider wrapper for direct SDK calls.
+
+4. Make sure traces are sent even when my code fails:
 
    try {
-     await handleRequest();
+     // ... my model calls ...
    } finally {
-     await papaya.flush();          // always flush, even when my code throws
+     await papaya.flush();
    }
 
-   - In a long-running server, ALSO flush on an interval (e.g. every 5–10s) and
-     once more on shutdown (SIGTERM, SIGINT, beforeExit) so in-flight traces
-     aren't lost on deploy/restart.
-   - Papaya swallows its own export errors (set debug:true to log them) and never
-     changes my provider results, so the flush in finally is safe.
-   - A workflow that throws is still exported, marked failed/partial — keep the
-     model calls inside the run() so the failure is attached to the trace.
+   In a long-running server, flush on an interval and once more on shutdown.
 
-7. Watch-outs:
-   - Streaming: streamed responses are currently captured with limited
-     output/usage. If a call's output or token counts matter for analysis,
-     prefer a non-streaming variant there, or confirm streaming capture is
-     supported before relying on it.
-   - Never put secrets in the `papaya` metadata field (it IS exported); the SDK
-     records header NAMES only, not values, and strips the `papaya` field before
-     the provider sees the request.
-   - capture: "full" disables local redaction — only use it where policy allows.
-   - Large payloads: avoid attaching huge blobs as metadata; keep prompts/outputs
-     as the captured payload.
-
-Find where I create each model client, where each request/job begins and ends, and
-where my agent loop lives. Show me the exact lines to add for init, the wrappers,
-the run() boundary, and the try/finally + shutdown flush. Leave the rest of my code
-unchanged.
+Find where I create my model client and where my request or job ends. Show me the
+exact lines to add for init, the wrapper, and the try/finally flush. Leave the
+rest of my code unchanged.
 ```
 
 ## Quick Start
@@ -204,7 +174,8 @@ await llmFetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-f
 
 ## SDK Wrappers
 
-The SDK wraps clients by shape, so you do not need a Papaya-specific provider dependency.
+The package is intentionally provider-SDK-free. The SDK wraps clients by shape,
+so you do not need a Papaya-specific provider dependency.
 
 ```ts
 const openai = papaya.openai(new OpenAI());
@@ -235,6 +206,100 @@ await openai.chat.completions.create({
 ```
 
 The `papaya` field is stripped before the provider SDK or REST endpoint receives the request.
+
+## TypeScript LangChain Callback Handler
+
+For TypeScript LangChain or LangGraph apps, install the optional callback handler
+from the `langchain` entrypoint and pass it through the normal runnable config.
+
+```ts
+import { Papaya } from "@papaya-ai/tracing";
+import { PapayaCallbackHandler } from "@papaya-ai/tracing/langchain";
+
+const papaya = Papaya.init({ apiKey: process.env.PAPAYA_API_KEY, project: "support-agent" });
+const callback = new PapayaCallbackHandler(papaya, {
+  workflowKey: "support_agent",
+  sessionId,
+  userId,
+});
+
+try {
+  const result = await agent.invoke(
+    { messages: [{ role: "user", content: userMessage }] },
+    { callbacks: [callback] },
+  );
+} finally {
+  await papaya.flush();
+}
+```
+
+See [`examples/langchain-callback.ts`](examples/langchain-callback.ts) for a
+runnable local example with a real OpenAI-backed LangChain chat model.
+
+## Python LangChain Callback Handler
+
+For LangChain or LangGraph apps, use the Python callback handler to capture the
+agent tree directly instead of wrapping a provider SDK call. The callback maps
+LangChain `run_id` / `parent_run_id` events into native Papaya spans, so chains,
+chat model calls, tools, and retrievers stay queryable as structured spans. It
+does not ship the conversation tree as a serialized JSON string.
+
+```python
+import os
+
+from papaya_ai import Papaya
+from papaya_ai.integrations.langchain import PapayaCallbackHandler
+
+papaya = Papaya.init(api_key=os.environ["PAPAYA_API_KEY"], project="support-agent")
+callback = PapayaCallbackHandler(
+    papaya,
+    workflow_key="support_agent",
+    session_id=session_id,
+    user_id=user_id,
+)
+
+try:
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": user_message}]},
+        config={"callbacks": [callback]},
+    )
+finally:
+    papaya.flush()
+```
+
+Use one capture path for the same execution: callback handler for the
+LangChain/LangGraph tree, provider wrapper for direct SDK calls. Combining both
+around the same model call can duplicate LLM spans unless that is intentional.
+See [`examples/python-langchain-callback.py`](examples/python-langchain-callback.py)
+for a runnable local example.
+
+## Python Provider SDK Wrappers
+
+The Python package also mirrors the TypeScript provider-wrapper model for direct
+SDK calls:
+
+```python
+import os
+
+from papaya_ai import Papaya
+
+papaya = Papaya.init(api_key=os.environ["PAPAYA_API_KEY"], project="support-agent")
+openai = papaya.openai(OpenAI())
+
+try:
+    with papaya.run({"workflowKey": "support_agent", "sessionId": session_id}):
+        result = openai.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": user_message}],
+        )
+finally:
+    papaya.flush()
+```
+
+Convenience wrappers are available as `papaya.openai(...)`,
+`papaya.anthropic(...)`, `papaya.claude(...)`, `papaya.gemini(...)`, and
+`papaya.bedrock(...)`. Use these for direct SDK calls; use the callback handler
+for LangChain/LangGraph run trees.
 
 ## Workflow Boundaries
 

@@ -2,17 +2,20 @@ import { Papaya } from "@papaya-ai/tracing";
 import { GoogleGenAI } from "@google/genai";
 
 const MODEL = "gemini-2.5-flash";
+const requireEnv = (name: string): string => {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required to run this real LLM example.`);
+  return value;
+};
 
 const papaya = Papaya.init({
-  // Your Papaya API key. Inline here for clarity; in a real app use:
-  //   apiKey: process.env.PAPAYA_API_KEY
-  apiKey: "ppy_live_XXXXXXXXXXXXXXXXXXXX",
+  apiKey: requireEnv("PAPAYA_API_KEY"),
   project: "papaya-demo",
   environment: "demo",
   capture: "full",
 });
 
-const gemini = papaya.gemini(new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }));
+const gemini = papaya.gemini(new GoogleGenAI({ apiKey: requireEnv("GEMINI_API_KEY") }));
 
 try {
   await papaya.run({ workflowKey: "error-handling", sessionId: "demo-session-4" }, async () => {

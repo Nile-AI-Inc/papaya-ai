@@ -96,6 +96,40 @@ type ActiveRun = Required<Pick<RunOptions, "traceId" | "runId">> & RunOptions & 
   spans: TraceSpan[];
 };
 
+export type PapayaPayloadRef = PayloadRef;
+export type PapayaTraceSpan = TraceSpan;
+export type PapayaTrace = ActiveRun;
+
+export type PapayaStartTraceOptions = {
+  rootSpanId?: string;
+  rootName?: string;
+  rootKind?: SpanKind;
+  inputValue?: unknown;
+  modelRef?: TraceSpan["modelRef"];
+  attributes?: Record<string, unknown>;
+  startedAt?: string;
+};
+
+export type PapayaStartSpanOptions = {
+  trace?: PapayaTrace;
+  spanId?: string;
+  parentSpanId?: string;
+  name: string;
+  kind: SpanKind;
+  inputValue?: unknown;
+  modelRef?: TraceSpan["modelRef"];
+  attributes?: Record<string, unknown>;
+  startedAt?: string;
+};
+
+export type PapayaFinishSpanOptions = {
+  outputValue?: unknown;
+  usage?: TraceSpan["usage"];
+  modelUsed?: string;
+  error?: unknown;
+  endedAt?: string;
+};
+
 type TraceBatch = {
   schemaVersion: "2026-06-05";
   batchId: string;
@@ -211,6 +245,9 @@ const usageFrom = (result: unknown): TraceSpan["usage"] | undefined => {
 };
 
 const numberValue = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+const compactRecord = <T extends Record<string, unknown>>(record: T): Partial<T> =>
+  Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined)) as Partial<T>;
 
 const isPromiseLike = (value: unknown): value is Promise<unknown> =>
   Boolean(value) && typeof value === "object" && typeof (value as { then?: unknown }).then === "function";
@@ -415,6 +452,43 @@ export class Papaya {
         throw error;
       }
     });
+  }
+
+  startTrace(options: RunOptions = {}, startOptions: PapayaStartTraceOptions = {}): PapayaTrace {
+    return this.createRun(mergeRunOptions(this.defaultRunOptions, options), startOptions);
+  }
+
+  finishTrace(trace: PapayaTrace, status: SpanStatus, options: PapayaFinishSpanOptions = {}): void {
+    this.finishRun(trace, status, options.error, options);
+  }
+
+  startSpan(options: PapayaStartSpanOptions): PapayaTraceSpan {
+    const run = options.trace ?? storage.getStore();
+    if (!run) {
+      throw new Error("Papaya.startSpan requires an explicit trace or an active papaya.run() scope.");
+    }
+    const span: TraceSpan = {
+      spanId: options.spanId ?? id("span"),
+      parentSpanId: options.parentSpanId ?? run.rootSpanId,
+      name: options.name,
+      kind: options.kind,
+      startedAt: options.startedAt ?? iso(),
+      status: "unknown",
+      ...(options.inputValue !== undefined ? { inputPayload: payload(options.inputValue, this.options.capture) } : {}),
+      ...(options.modelRef ? { modelRef: options.modelRef } : {}),
+      ...(options.attributes ? { attributes: options.attributes } : {}),
+    };
+    run.spans.push(span);
+    return span;
+  }
+
+  finishSpan(span: PapayaTraceSpan, status: SpanStatus, options: PapayaFinishSpanOptions = {}): void {
+    span.endedAt = options.endedAt ?? iso();
+    span.status = status;
+    if (options.outputValue !== undefined) span.outputPayload = payload(options.outputValue, this.options.capture);
+    if (options.usage) span.usage = compactRecord(options.usage) as TraceSpan["usage"];
+    if (options.modelUsed) span.modelRef = { ...span.modelRef, used: options.modelUsed };
+    if (options.error !== undefined) span.error = errorPayload(options.error);
   }
 
   openai<T extends object>(client: T, options?: RunOptions): T {
@@ -632,8 +706,8 @@ export class Papaya {
     }
   }
 
-  private createRun(options: RunOptions): ActiveRun {
-    const rootSpanId = id("span");
+  private createRun(options: RunOptions, startOptions: PapayaStartTraceOptions = {}): ActiveRun {
+    const rootSpanId = startOptions.rootSpanId ?? id("span");
     const traceId = options.traceId ?? id("trace");
     const runId = options.runId ?? id("run");
     return {
@@ -643,24 +717,30 @@ export class Papaya {
       rootSpanId,
       spans: [{
         spanId: rootSpanId,
-        name: options.workflowLabel ?? options.workflowKey ?? "papaya.run",
-        kind: "workflow",
-        startedAt: iso(),
+        name: startOptions.rootName ?? options.workflowLabel ?? options.workflowKey ?? "papaya.run",
+        kind: startOptions.rootKind ?? "workflow",
+        startedAt: startOptions.startedAt ?? iso(),
         status: "unknown",
+        ...(startOptions.inputValue !== undefined ? { inputPayload: payload(startOptions.inputValue, this.options.capture) } : {}),
+        ...(startOptions.modelRef ? { modelRef: startOptions.modelRef } : {}),
         attributes: {
           project: this.options.project,
           environment: this.options.environment,
           metadata: options.metadata,
+          ...(startOptions.attributes ?? {}),
         },
       }],
     };
   }
 
-  private finishRun(run: ActiveRun, status: SpanStatus, error?: unknown): void {
+  private finishRun(run: ActiveRun, status: SpanStatus, error?: unknown, options: PapayaFinishSpanOptions = {}): void {
     run.spans[0] = {
       ...run.spans[0]!,
-      endedAt: iso(),
+      endedAt: options.endedAt ?? iso(),
       status,
+      ...(options.outputValue !== undefined ? { outputPayload: payload(options.outputValue, this.options.capture) } : {}),
+      ...(options.usage ? { usage: compactRecord(options.usage) as TraceSpan["usage"] } : {}),
+      ...(options.modelUsed ? { modelRef: { ...run.spans[0]?.modelRef, used: options.modelUsed } } : {}),
       ...(error !== undefined ? { error: errorPayload(error) } : {}),
     };
     this.completed.push(run);

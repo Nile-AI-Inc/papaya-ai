@@ -2,12 +2,15 @@ import { Papaya } from "@papaya-ai/tracing";
 import { BedrockRuntime } from "@aws-sdk/client-bedrock-runtime";
 
 const MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
+const requireEnv = (name: string): string => {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required to run this real LLM example.`);
+  return value;
+};
 
 // 1. Start Papaya.
 const papaya = Papaya.init({
-  // Key is inline so you can see exactly where it goes. In a real app use:
-  //   apiKey: process.env.PAPAYA_API_KEY
-  apiKey: "ppy_live_XXXXXXXXXXXXXXXXXXXX",
+  apiKey: requireEnv("PAPAYA_API_KEY"),
   project: "papaya-demo",
   environment: "demo",
   capture: "full", // capture full prompts + responses for the demo

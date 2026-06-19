@@ -1,6 +1,6 @@
 {
   "name": "@papaya-ai/tracing",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Papaya AI agent trace capture SDK for production apps.",
   "license": "MIT",
   "type": "module",
@@ -23,7 +23,8 @@
     "anthropic",
     "gemini",
     "bedrock",
-    "vercel-ai-sdk"
+    "vercel-ai-sdk",
+    "langchain"
   ],
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -33,6 +34,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./langchain": {
+      "types": "./dist/langchain.d.ts",
+      "import": "./dist/langchain.js",
+      "default": "./dist/langchain.js"
     }
   },
   "files": [
@@ -48,17 +54,28 @@
   "engines": {
     "node": ">=20"
   },
+  "peerDependencies": {
+    "@langchain/core": ">=0.3 <2"
+  },
+  "peerDependenciesMeta": {
+    "@langchain/core": {
+      "optional": true
+    }
+  },
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "check:node": "node ./scripts/check-node-version.mjs",
     "prebuild": "npm run check:node",
     "prepack": "npm run build",
     "pretest": "npm run check:node",
-    "test": "tsx test/sdk.test.ts",
+    "test": "tsx test/sdk.test.ts && tsx test/langchain.test.ts",
     "pretypecheck": "npm run check:node",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
   "devDependencies": {
+    "@google/genai": "^2.8.0",
+    "@langchain/core": "^1.2.0",
+    "@langchain/openai": "^1.5.1",
     "@types/node": "^25.7.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"

@@ -85,10 +85,10 @@ def main() -> int:
         endpoint=os.getenv("PAPAYA_ENDPOINT") or "https://papaya.fyi/api/v1/ingest/traces",
         project=os.getenv("PAPAYA_PROJECT") or "papaya-python-demo",
         environment=os.getenv("PAPAYA_ENVIRONMENT") or "demo",
-        service_name="python-langchain-callback-example",
+        service_name="langchain-callback-python-example",
         capture=os.getenv("PAPAYA_CAPTURE") or "redacted",
         debug=os.getenv("PAPAYA_DEBUG") == "1",
-        metadata={"example": "python-langchain-callback"},
+        metadata={"example": "langchain-callback-python"},
     )
     callback = PapayaCallbackHandler(
         papaya,
@@ -102,7 +102,7 @@ def main() -> int:
     try:
         result = build_agent(model).invoke(
             {"message": "Can we refund this customer after failed onboarding?"},
-            config={"callbacks": [callback], "metadata": {"route": "examples/python-langchain-callback.py", "model": model}},
+            config={"callbacks": [callback], "metadata": {"route": "examples/langchain-callback.py", "model": model}},
         )
         print("\nAgent answer:")
         print(result["output"])

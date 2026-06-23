@@ -10,10 +10,12 @@ Each one initializes Papaya, makes a provider or framework call, and flushes the
 | [`gemini-fetch-raw.ts`](gemini-fetch-raw.ts) | The same call **without** the SDK, for comparison (no tracing) |
 | [`error-handling.ts`](error-handling.ts) | Flush in `finally` so failed jobs still send their trace |
 | [`agent.ts`](agent.ts) | A Bedrock tool-use agent loop captured as one workflow — `papaya.bedrock(...)` |
+| [`openai-wrapper.py`](openai-wrapper.py) | Minimal Python provider SDK wrapper shape — `papaya.openai(...)` |
 | [`langchain-callback.ts`](langchain-callback.ts) | Capture a real TypeScript LangChain runnable tree with `PapayaCallbackHandler` |
-| [`python-openai-wrapper.py`](python-openai-wrapper.py) | Minimal Python provider SDK wrapper shape — `papaya.openai(...)` |
-| [`python-langchain-callback-minimal.py`](python-langchain-callback-minimal.py) | Minimal real LangChain runnable captured with `PapayaCallbackHandler` |
-| [`python-langchain-callback.py`](python-langchain-callback.py) | Larger LangChain runnable tree with two real chat model calls |
+| [`langchain-callback-minimal.py`](langchain-callback-minimal.py) | Minimal Python LangChain runnable captured with `PapayaCallbackHandler` |
+| [`langchain-callback.py`](langchain-callback.py) | Larger Python LangChain runnable tree with two real chat model calls |
+| [`langchain-langfuse-papaya.ts`](langchain-langfuse-papaya.ts) | Send one LangChain agent run to both Langfuse and Papaya callback handlers |
+| [`langchain-langfuse-papaya.py`](langchain-langfuse-papaya.py) | Python version of the Langfuse + Papaya callback handler example |
 
 ## Run TypeScript Examples
 
@@ -35,14 +37,22 @@ chat model, so it requires `OPENAI_API_KEY`:
 npx tsx --env-file=.env langchain-callback.ts
 ```
 
+To test Papaya beside Langfuse on the same LangChain run:
+
+```sh
+npm i @papaya-ai/tracing @langchain/core @langchain/openai @langfuse/langchain @langfuse/otel @opentelemetry/sdk-node openai tsx
+export LANGFUSE_BASE_URL=http://127.0.0.1:3000   # local Langfuse only
+npx tsx --env-file=.env langchain-langfuse-papaya.ts
+```
+
 ## Run The Python Callback Example
 
 From this folder:
 
 ```sh
 python3 -m pip install "openai>=1.0" "langchain-openai>=0.3"
-python3 python-openai-wrapper.py
-python3 python-langchain-callback-minimal.py
+python3 openai-wrapper.py
+python3 langchain-callback-minimal.py
 ```
 
 The Python wrapper and callback examples use real OpenAI calls, so they require
@@ -51,11 +61,19 @@ call but report that Papaya export was skipped. To send the example trace, pass 
 Papaya key:
 
 ```sh
-PAPAYA_API_KEY=ppy_live_... python3 python-langchain-callback-minimal.py
+PAPAYA_API_KEY=ppy_live_... python3 langchain-callback-minimal.py
 ```
 
-Run `python-langchain-callback.py` when you want the fuller tree with two real
+Run `langchain-callback.py` when you want the fuller tree with two real
 chat model calls in one LangChain runnable.
+
+To test Papaya beside Langfuse on the same Python LangChain run:
+
+```sh
+python3 -m pip install "langfuse>=3" "langchain>=0.3" "langchain-openai>=0.3"
+export LANGFUSE_HOST=http://127.0.0.1:3000   # local Langfuse only
+python3 langchain-langfuse-papaya.py
+```
 
 When running from this monorepo, the example automatically imports the unpublished
 local Python SDK from `packages/papaya-ai-python/src`. After the Python package is
@@ -125,5 +143,7 @@ disable LLM capture in the callback handler.
 - **Gemini** (`gemini-*`, `error-handling`) — `GEMINI_API_KEY`, from https://aistudio.google.com/apikey
 - **Bedrock** (`agent.ts`) — `AWS_PROFILE` + `AWS_REGION`, with access to the Claude inference profile.
 - **TypeScript callback** (`langchain-callback.ts`) — `OPENAI_API_KEY` for the real model call, `PAPAYA_API_KEY` to export.
-- **Python provider wrapper** (`python-openai-wrapper.py`) — `OPENAI_API_KEY` for the real model call, `PAPAYA_API_KEY` to export.
-- **Python callback** (`python-langchain-callback-minimal.py`, `python-langchain-callback.py`) — `OPENAI_API_KEY` for the real model call, `PAPAYA_API_KEY` to export, plus optional `PAPAYA_ENDPOINT` for local ingest testing.
+- **TypeScript Langfuse + Papaya callback** (`langchain-langfuse-papaya.ts`) — `OPENAI_API_KEY`, `PAPAYA_API_KEY`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and optional `LANGFUSE_BASE_URL`.
+- **Python provider wrapper** (`openai-wrapper.py`) — `OPENAI_API_KEY` for the real model call, `PAPAYA_API_KEY` to export.
+- **Python callback** (`langchain-callback-minimal.py`, `langchain-callback.py`) — `OPENAI_API_KEY` for the real model call, `PAPAYA_API_KEY` to export, plus optional `PAPAYA_ENDPOINT` for local ingest testing.
+- **Python Langfuse + Papaya callback** (`langchain-langfuse-papaya.py`) — `OPENAI_API_KEY`, `PAPAYA_API_KEY`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and optional `LANGFUSE_HOST`.

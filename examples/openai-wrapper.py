@@ -42,7 +42,7 @@ papaya = Papaya.init(
     project="papaya-python-demo",
     environment="demo",
 )
-openai = papaya.openai(OpenAI(api_key=openai_api_key), {"workflowKey": "python_openai_wrapper"})
+openai = papaya.openai(OpenAI(api_key=openai_api_key), {"workflowKey": "openai_wrapper"})
 
 try:
     print("OpenAI request:")
@@ -50,7 +50,7 @@ try:
     with papaya.run({"sessionId": "demo-session-py", "userId": "demo-user"}):
         response = openai.chat.completions.create(
             **request,
-            papaya={"metadata": {"example": "python-openai-wrapper"}},
+            papaya={"metadata": {"example": "openai-wrapper"}},
         )
     response_json = response.model_dump()
     print("\nOpenAI response:")

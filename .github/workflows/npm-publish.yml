@@ -1,4 +1,4 @@
-name: Publish to npm
+name: Publish SDK Packages
 
 on:
   workflow_dispatch:
@@ -8,13 +8,18 @@ on:
         required: true
         type: boolean
         default: false
+      publish_pypi:
+        description: "Publish papaya-ai to PyPI with trusted publishing"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
-  verify:
-    name: Verify package
+  verify-node:
+    name: Verify npm package
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -38,9 +43,40 @@ jobs:
       - name: Dry-run package
         run: npm pack --dry-run
 
-  publish:
-    name: Publish package
-    needs: verify
+  verify-python:
+    name: Verify Python package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Test Python SDK
+        run: python -m unittest discover packages/papaya-ai-python/tests
+
+      - name: Build Python package
+        run: python -m build packages/papaya-ai-python
+
+      - name: Check Python package metadata
+        run: python -m twine check packages/papaya-ai-python/dist/*
+
+      - name: Install Python package artifact
+        run: python -m pip install "$(find packages/papaya-ai-python/dist -name 'papaya_ai-*.whl' -print -quit)[langchain]"
+
+      - name: Smoke Python LangChain import
+        run: python -c "from papaya_ai import Papaya; from papaya_ai.integrations.langchain import PapayaCallbackHandler; print(Papaya.__name__, PapayaCallbackHandler.__name__)"
+
+  publish-npm:
+    name: Publish npm package
+    needs: verify-node
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && inputs.publish_npm
     environment: npm-publish
@@ -69,3 +105,39 @@ jobs:
 
       - name: Publish with provenance
         run: npm publish --access public --provenance
+
+  publish-pypi:
+    name: Publish PyPI package
+    needs: verify-python
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_pypi
+    environment: pypi-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Test Python SDK
+        run: python -m unittest discover packages/papaya-ai-python/tests
+
+      - name: Build Python package
+        run: python -m build packages/papaya-ai-python
+
+      - name: Check Python package metadata
+        run: python -m twine check packages/papaya-ai-python/dist/*
+
+      - name: Publish with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/papaya-ai-python/dist

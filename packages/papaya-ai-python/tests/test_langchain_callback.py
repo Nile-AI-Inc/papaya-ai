@@ -3,7 +3,7 @@ import pathlib
 import sys
 import unittest
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -169,7 +169,8 @@ class PapayaLangChainCallbackTest(unittest.TestCase):
         self.assertEqual(llm_span["modelRef"]["requested"], "gpt-test")
         self.assertEqual(llm_span["usage"]["inputTokens"], 12)
         self.assertEqual(llm_span["usage"]["outputTokens"], 8)
-        history_message = llm_span["inputPayload"]["value"][0][1]
+        self.assertEqual(len(llm_span["inputPayload"]["value"][0]), 1)
+        history_message = llm_span["inputPayload"]["value"][0][0]
         self.assertEqual(history_message["id"], "history-message")
         self.assertEqual(history_message["toolCalls"][0]["name"], "lookup_policy")
         self.assertEqual(
@@ -398,6 +399,61 @@ class PapayaLangChainCallbackTest(unittest.TestCase):
         self.assertNotIn("additional_kwargs", exported)
         self.assertNotIn("response_metadata", exported)
         self.assertNotIn("invalid_tool_calls", exported)
+
+    def test_parent_history_is_removed_when_system_message_precedes_it(self):
+        captured = []
+
+        def transport(endpoint, headers, body):
+            captured.append(json.loads(body.decode("utf-8")))
+            return 202, '{"accepted":1,"rejected":0}'
+
+        papaya = Papaya.init(
+            api_key="papaya-test-token",
+            endpoint="https://papaya.example/api/v1/ingest/traces",
+            capture="full",
+            transport=transport,
+        )
+        handler = PapayaCallbackHandler(papaya, workflow_key="history_subsequence")
+        handler.on_chain_start(
+            {"name": "ConversationAgent"},
+            {
+                "message": "Turn two",
+                "history": [
+                    HumanMessage(content="Turn one"),
+                    AIMessage(content="First answer"),
+                ],
+            },
+            run_id="history-root",
+        )
+        handler.on_chat_model_start(
+            {"name": "ConversationModel"},
+            [[
+                SystemMessage(content="Answer concisely."),
+                HumanMessage(content="Turn one"),
+                AIMessage(content="First answer"),
+                HumanMessage(content="Turn two"),
+            ]],
+            run_id="history-llm",
+            parent_run_id="history-root",
+        )
+        handler.on_llm_end(
+            LLMResult(generations=[[
+                ChatGeneration(message=AIMessage(content="Second answer"))
+            ]]),
+            run_id="history-llm",
+        )
+        handler.on_chain_end({"output": "Second answer"}, run_id="history-root")
+        self.assertEqual(papaya.flush()["status"], "sent")
+
+        trace = captured[0]["traces"][0]
+        llm_span = next(span for span in trace["spans"] if span["name"] == "ConversationModel")
+        self.assertEqual(
+            llm_span["inputPayload"]["value"],
+            [[
+                {"role": "system", "content": "Answer concisely."},
+                {"role": "user", "content": "Turn two"},
+            ]],
+        )
 
 
 if __name__ == "__main__":

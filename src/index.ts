@@ -168,7 +168,7 @@ type PendingBatch = {
   body: string;
 };
 
-const SDK_VERSION = "0.1.2";
+const SDK_VERSION = "0.1.3";
 const DEFAULT_MAX_BATCH_BYTES = 512 * 1024;
 
 const storage = new AsyncLocalStorage<ActiveRun>();

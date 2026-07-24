@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { AIMessage, HumanMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage, SystemMessage } from "@langchain/core/messages";
 import type { ChatGeneration, LLMResult } from "@langchain/core/outputs";
 
 import { Papaya } from "../src/index.js";
@@ -261,6 +261,47 @@ try {
   assert.equal(JSON.stringify(branchTrace).includes("additional_kwargs"), false);
   assert.equal(JSON.stringify(branchTrace).includes("response_metadata"), false);
   assert.equal(JSON.stringify(branchTrace).includes("invalid_tool_calls"), false);
+
+  const historyPapaya = Papaya.init({
+    apiKey: "papaya-test-token",
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+    capture: "full",
+  });
+  const historyCallback = new PapayaCallbackHandler(historyPapaya, { workflowKey: "history_subsequence" });
+  historyCallback.handleChainStart(
+    { name: "ConversationAgent" },
+    {
+      message: "Turn two",
+      history: [
+        new HumanMessage("Turn one"),
+        new AIMessage("First answer"),
+      ],
+    },
+    "history-root",
+  );
+  historyCallback.handleChatModelStart(
+    { name: "ConversationModel" },
+    [[
+      new SystemMessage("Answer concisely."),
+      new HumanMessage("Turn one"),
+      new AIMessage("First answer"),
+      new HumanMessage("Turn two"),
+    ]],
+    "history-llm",
+    "history-root",
+  );
+  historyCallback.handleLLMEnd({
+    generations: [[{ message: new AIMessage("Second answer") }]],
+  }, "history-llm");
+  historyCallback.handleChainEnd({ output: "Second answer" }, "history-root");
+  assert.equal((await historyPapaya.flush()).status, "sent");
+  const historyTrace = (captured[2]?.body.traces as Array<Record<string, unknown>>)[0]!;
+  const historyLlm = (historyTrace.spans as Array<Record<string, unknown>>)
+    .find((span) => span.name === "ConversationModel");
+  assert.deepEqual((historyLlm?.inputPayload as { value?: unknown }).value, [[
+    { role: "system", content: "Answer concisely." },
+    { role: "user", content: "Turn two" },
+  ]]);
 
   console.log("papaya-ai LangChain callback tests passed");
 } finally {

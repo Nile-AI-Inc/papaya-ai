@@ -25,9 +25,10 @@ type RunState = {
   span: PapayaTraceSpan;
   kind: SpanKind;
   parentRunId?: string;
+  inputMessages?: MessageBatches;
   llm?: {
     laneKey: string;
-    fullInput?: MessageBatches;
+    laneInput?: MessageBatches;
     overlapped: boolean;
   };
 };
@@ -165,6 +166,48 @@ const compactMessageBatches = (messages: unknown): MessageBatches => {
   return [messages.map((message) => compactMessage(message))];
 };
 
+const isMessageLike = (value: unknown): boolean =>
+  isRecord(value)
+  && "content" in value
+  && (
+    "role" in value
+    || "type" in value
+    || typeof value._getType === "function"
+    || ["humanmessage", "aimessage", "systemmessage", "toolmessage"].includes(
+      String(value.constructor?.name ?? "").toLowerCase(),
+    )
+  );
+
+const compactLangChainValue = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    if (value.length > 0 && value.every((item) => isMessageLike(item))) {
+      return value.map((message) => compactMessage(message));
+    }
+    return value.map((item) => compactLangChainValue(item));
+  }
+  if (!isRecord(value)) return jsonable(value);
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, compactLangChainValue(item)]),
+  );
+};
+
+const messageBatchesFromValue = (value: unknown): MessageBatches => {
+  const batches: MessageBatches = [];
+  const visit = (current: unknown): void => {
+    if (Array.isArray(current)) {
+      if (current.length > 0 && current.every((item) => isMessageLike(item))) {
+        batches.push(current.map((message) => compactMessage(message)));
+        return;
+      }
+      current.forEach((item) => visit(item));
+      return;
+    }
+    if (isRecord(current)) Object.values(current).forEach((item) => visit(item));
+  };
+  visit(value);
+  return batches;
+};
+
 const compactGenerations = (value: unknown): unknown => {
   const generations = isRecord(value) && Array.isArray(value.generations) ? value.generations : undefined;
   if (!generations) return jsonable(value);
@@ -218,6 +261,28 @@ const boundaryOverlapLength = (previousOutput: unknown[], suffix: unknown[]): nu
     if (outputTail.every((message, index) => messagesEqual(message, suffixHead[index], true))) return size;
   }
   return 0;
+};
+
+const removeKnownHistory = (known: MessageBatches, current: MessageBatches): MessageBatches => {
+  return current.map((batch) => {
+    let retained = batch;
+    for (const previousBatch of known) {
+      if (previousBatch.length === 0 || previousBatch.length > retained.length) continue;
+      for (let start = 0; start <= retained.length - previousBatch.length; start += 1) {
+        if (
+          previousBatch.every((message, index) =>
+            messagesEqual(message, retained[start + index], true))
+        ) {
+          retained = [
+            ...retained.slice(0, start),
+            ...retained.slice(start + previousBatch.length),
+          ];
+          break;
+        }
+      }
+    }
+    return retained;
+  });
 };
 
 const compactRepeatedHistory = (previous: LaneSnapshot, current: MessageBatches): MessageBatches | undefined => {
@@ -427,6 +492,7 @@ export class PapayaCallbackHandler extends BaseCallbackHandler {
     inputPayload?: PapayaPayloadRef;
     metadata?: Record<string, unknown>;
     modelRef?: { provider?: string; requested?: string };
+    inputMessages?: MessageBatches;
     llm?: RunState["llm"];
   }): void {
     const runId = idText(input.runId);
@@ -465,6 +531,9 @@ export class PapayaCallbackHandler extends BaseCallbackHandler {
         span: trace.spans[0]!,
         kind: input.kind,
         parentRunId,
+        ...(input.inputMessages && input.inputMessages.length > 0
+          ? { inputMessages: input.inputMessages }
+          : {}),
         ...(input.llm ? { llm: input.llm } : {}),
       });
       return;
@@ -485,6 +554,9 @@ export class PapayaCallbackHandler extends BaseCallbackHandler {
       span,
       kind: input.kind,
       parentRunId,
+      ...(input.inputMessages && input.inputMessages.length > 0
+        ? { inputMessages: input.inputMessages }
+        : {}),
       ...(input.llm ? { llm: input.llm } : {}),
     });
   }
@@ -517,10 +589,10 @@ export class PapayaCallbackHandler extends BaseCallbackHandler {
         && input.status === "success"
         && !state.llm.overlapped
         && lane.activeRunIds.size === 0
-        && state.llm.fullInput
+        && state.llm.laneInput
       ) {
         lane.previous = {
-          input: state.llm.fullInput,
+          input: state.llm.laneInput,
           output: input.outputMessages ?? [],
         };
       } else if (lane) {
@@ -574,9 +646,15 @@ export class PapayaCallbackHandler extends BaseCallbackHandler {
     const compact = compactMessageBatches(messages);
     const fullPayload = this.papaya.capturePayload(compact);
     const fullInput = messageBatchesFromPayload(fullPayload);
-    const retained = fullInput && lane.activeRunIds.size === 0 && lane.previous
-      ? compactRepeatedHistory(lane.previous, fullInput)
-      : undefined;
+    const parentMessages = parentRunId ? this.runs.get(parentRunId)?.inputMessages : undefined;
+    const afterParent = fullInput && parentMessages
+      ? removeKnownHistory(parentMessages, fullInput)
+      : fullInput;
+    const retained = afterParent && lane.activeRunIds.size === 0 && lane.previous
+      ? compactRepeatedHistory(lane.previous, afterParent)
+      : afterParent !== fullInput
+        ? afterParent
+        : undefined;
     const inputPayload = retained ? payloadWithValue(fullPayload, retained) : fullPayload;
     lane.activeRunIds.add(runId);
 
@@ -584,7 +662,7 @@ export class PapayaCallbackHandler extends BaseCallbackHandler {
       inputPayload,
       llm: {
         laneKey,
-        fullInput,
+        ...(afterParent ? { laneInput: afterParent } : {}),
         overlapped: lane.activeRunIds.size > 1,
       },
     };
@@ -600,13 +678,14 @@ export class PapayaCallbackHandler extends BaseCallbackHandler {
       parentRunId,
       name: runName ?? serializedName(serialized, runType ? `langchain.${runType}` : "langchain.chain"),
       kind: parentRunId ? "workflow" : "agent",
-      inputValue: jsonable(inputs),
+      inputValue: compactLangChainValue(inputs),
+      inputMessages: messageBatchesFromValue(inputs),
       metadata,
     });
   }
 
   handleChainEnd(outputs: unknown, runId: string): void {
-    this.finish({ runId, status: "success", outputValue: jsonable(outputs) });
+    this.finish({ runId, status: "success", outputValue: compactLangChainValue(outputs) });
   }
 
   handleChainError(error: Error, runId: string): void {

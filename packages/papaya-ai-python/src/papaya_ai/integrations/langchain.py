@@ -119,6 +119,47 @@ def _compact_message_batches(messages: Any) -> list[list[Any]]:
     return [[_compact_message(message) for message in messages]]
 
 
+def _is_message_like(value: Any) -> bool:
+    if isinstance(value, dict):
+        return "content" in value and ("role" in value or "type" in value)
+    return hasattr(value, "content") and (
+        hasattr(value, "role")
+        or hasattr(value, "type")
+        or callable(getattr(value, "_get_type", None))
+        or value.__class__.__name__.lower()
+        in {"humanmessage", "aimessage", "systemmessage", "toolmessage"}
+    )
+
+
+def _compact_langchain_value(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        if value and all(_is_message_like(item) for item in value):
+            return [_compact_message(message) for message in value]
+        return [_compact_langchain_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _compact_langchain_value(item) for key, item in value.items()}
+    return _jsonable(value)
+
+
+def _message_batches_from_value(value: Any) -> list[list[Any]]:
+    batches: list[list[Any]] = []
+
+    def visit(current: Any) -> None:
+        if isinstance(current, (list, tuple)):
+            if current and all(_is_message_like(item) for item in current):
+                batches.append([_compact_message(message) for message in current])
+                return
+            for item in current:
+                visit(item)
+            return
+        if isinstance(current, dict):
+            for item in current.values():
+                visit(item)
+
+    visit(value)
+    return batches
+
+
 def _compact_generations(response: Any) -> Any:
     generations = getattr(response, "generations", None)
     if generations is None and isinstance(response, dict):
@@ -185,6 +226,31 @@ def _boundary_overlap_length(previous_output: list[Any], suffix: list[Any]) -> i
         ):
             return size
     return 0
+
+
+def _remove_known_history(
+    known: list[list[Any]],
+    current: list[list[Any]],
+) -> list[list[Any]]:
+    retained_batches: list[list[Any]] = []
+    for batch in current:
+        retained = list(batch)
+        for previous_batch in known:
+            if not previous_batch or len(previous_batch) > len(retained):
+                continue
+            for start in range(len(retained) - len(previous_batch) + 1):
+                if all(
+                    _messages_equal(
+                        message,
+                        retained[start + index],
+                        ignore_source_message_id=True,
+                    )
+                    for index, message in enumerate(previous_batch)
+                ):
+                    retained = retained[:start] + retained[start + len(previous_batch):]
+                    break
+        retained_batches.append(retained)
+    return retained_batches
 
 
 def _compact_repeated_history(
@@ -411,7 +477,7 @@ class _LaneState:
 @dataclass
 class _LlmState:
     lane_key: str
-    full_input: list[list[Any]] | None
+    lane_input: list[list[Any]] | None
     overlapped: bool = False
 
 
@@ -421,6 +487,7 @@ class _RunState:
     span: dict[str, Any]
     kind: SpanKind
     parent_run_id: str | None
+    input_messages: list[list[Any]] | None = None
     llm: _LlmState | None = None
 
 
@@ -467,6 +534,7 @@ class PapayaCallbackHandler(BaseCallbackHandler):  # type: ignore[misc,valid-typ
         input_payload: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         model_ref: dict[str, Any] | None = None,
+        input_messages: list[list[Any]] | None = None,
         llm: _LlmState | None = None,
     ) -> None:
         run_key = _id_text(run_id)
@@ -514,6 +582,7 @@ class PapayaCallbackHandler(BaseCallbackHandler):  # type: ignore[misc,valid-typ
             span=span,
             kind=kind,
             parent_run_id=parent_key,
+            input_messages=input_messages or None,
             llm=llm,
         )
 
@@ -547,10 +616,10 @@ class PapayaCallbackHandler(BaseCallbackHandler):  # type: ignore[misc,valid-typ
                     status == "success"
                     and not state.llm.overlapped
                     and not lane.active_run_ids
-                    and state.llm.full_input is not None
+                    and state.llm.lane_input is not None
                 ):
                     lane.previous = _LaneSnapshot(
-                        input=state.llm.full_input,
+                        input=state.llm.lane_input,
                         output=output_messages or [],
                     )
                 else:
@@ -606,16 +675,23 @@ class PapayaCallbackHandler(BaseCallbackHandler):  # type: ignore[misc,valid-typ
         compact = _compact_message_batches(messages)
         full_payload = self.papaya.capture_payload(compact)
         full_input = _message_batches_from_payload(full_payload)
+        parent_state = self._runs.get(parent_key) if parent_key is not None else None
+        parent_messages = parent_state.input_messages if parent_state is not None else None
+        after_parent = (
+            _remove_known_history(parent_messages, full_input)
+            if full_input is not None and parent_messages
+            else full_input
+        )
         retained = (
-            _compact_repeated_history(lane.previous, full_input)
-            if full_input is not None and not lane.active_run_ids and lane.previous is not None
-            else None
+            _compact_repeated_history(lane.previous, after_parent)
+            if after_parent is not None and not lane.active_run_ids and lane.previous is not None
+            else after_parent if after_parent is not full_input else None
         )
         input_payload = _payload_with_value(full_payload, retained) if retained is not None else full_payload
         lane.active_run_ids.add(run_key)
         return input_payload, _LlmState(
             lane_key=lane_key,
-            full_input=full_input,
+            lane_input=after_parent,
             overlapped=len(lane.active_run_ids) > 1,
         )
 
@@ -625,12 +701,13 @@ class PapayaCallbackHandler(BaseCallbackHandler):  # type: ignore[misc,valid-typ
             parent_run_id=parent_run_id,
             name=name or _serialized_name(serialized, "langchain.chain"),
             kind="agent" if parent_run_id is None else "workflow",
-            input_value=_jsonable(inputs),
+            input_value=_compact_langchain_value(inputs),
+            input_messages=_message_batches_from_value(inputs),
             metadata={**(metadata or {}), "tags": tags or []},
         )
 
     def on_chain_end(self, outputs: Any, *, run_id: Any, **kwargs: Any) -> None:
-        self._finish(run_id=run_id, status="success", output_value=_jsonable(outputs))
+        self._finish(run_id=run_id, status="success", output_value=_compact_langchain_value(outputs))
 
     def on_chain_error(self, error: BaseException, *, run_id: Any, **kwargs: Any) -> None:
         self._finish(run_id=run_id, status="failed", error=error)

@@ -25,6 +25,7 @@ Run the Python checks from the standalone SDK repo root:
 
 ```sh
 python -m pip install --upgrade pip build twine
+python -m pip install -e './packages/papaya-ai-python[test]'
 python -m unittest discover packages/papaya-ai-python/tests
 python -m build packages/papaya-ai-python
 python -m twine check packages/papaya-ai-python/dist/*
@@ -39,6 +40,7 @@ npm run typecheck --workspace @papaya-ai/tracing
 npm run test --workspace @papaya-ai/tracing
 npm pack --workspace @papaya-ai/tracing --dry-run
 npm run test:papaya-ai-sdk-release
+python -m pip install -e './packages/papaya-ai-python[test]'
 python -m unittest discover packages/papaya-ai-python/tests
 python -m build packages/papaya-ai-python
 python -m twine check packages/papaya-ai-python/dist/*

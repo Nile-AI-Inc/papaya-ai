@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type OpenAI from "openai";
 
 import { Papaya, type PapayaFetchInit } from "../src/index.js";
 
@@ -22,22 +23,31 @@ type ExportedTrace = {
   }>;
 };
 
-class FakeOpenAI {
+const openAIChatCompletion = {
+  id: "completion-1",
+  object: "chat.completion",
+  created: 1_700_000_000,
+  model: "gpt-test-used",
+  choices: [{
+    index: 0,
+    finish_reason: "stop",
+    logprobs: null,
+    message: { role: "assistant", content: "hello back", refusal: null, annotations: [] },
+  }],
+  usage: {
+    prompt_tokens: 11,
+    completion_tokens: 7,
+    total_tokens: 18,
+  },
+} satisfies OpenAI.Chat.Completions.ChatCompletion;
+
+class OpenAIClientHarness {
   public readonly providerRequests: unknown[] = [];
   public readonly chat = {
     completions: {
       create: async (request: unknown) => {
         this.providerRequests.push(request);
-        return {
-          id: "completion-1",
-          model: "gpt-test-used",
-          choices: [{ message: { role: "assistant", content: "hello back" } }],
-          usage: {
-            input_tokens: 11,
-            output_tokens: 7,
-            total_tokens: 18,
-          },
-        };
+        return openAIChatCompletion;
       },
     },
   };
@@ -56,7 +66,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 }) as typeof fetch;
 
 try {
-  const provider = new FakeOpenAI();
+  const provider = new OpenAIClientHarness();
   const papaya = Papaya.init({
     apiKey: "papaya-test-token",
     endpoint: "https://papaya.example/api/v1/ingest/traces",
@@ -97,6 +107,13 @@ try {
   });
   assert.equal(captured[0]?.url, "https://papaya.example/api/v1/ingest/traces");
   assert.equal((captured[0]?.init?.headers as Record<string, string>).Authorization, "Bearer papaya-test-token");
+  assert.equal((captured[0]?.init?.headers as Record<string, string>)["User-Agent"], "@papaya-ai/tracing/0.1.2");
+  assert.deepEqual(captured[0]?.body.sdk, {
+    name: "@papaya-ai/tracing",
+    version: "0.1.2",
+    language: "typescript",
+    runtime: `node/${process.version}`,
+  });
   const exported = JSON.stringify(captured[0]?.body);
   assert.equal(exported.includes("ada@example.com"), false);
   assert.equal(exported.includes("Bearer abc.secret.token"), false);
@@ -120,7 +137,7 @@ try {
     claimId: "claim-1",
   });
 
-  const metadataProvider = new FakeOpenAI();
+  const metadataProvider = new OpenAIClientHarness();
   const metadataPapaya = Papaya.init({
     apiKey: "papaya-test-token",
     endpoint: "https://papaya.example/api/v1/ingest/traces",
@@ -143,7 +160,7 @@ try {
   const missingKeyPapaya = Papaya.init({
     endpoint: "https://papaya.example/api/v1/ingest/traces",
   });
-  const missingKeyOpenai = missingKeyPapaya.openai(new FakeOpenAI());
+  const missingKeyOpenai = missingKeyPapaya.openai(new OpenAIClientHarness());
   await missingKeyOpenai.chat.completions.create({
     model: "gpt-test",
     messages: [{ role: "user", content: "hello" }],
@@ -334,6 +351,103 @@ try {
   assert.equal(jsonSpan.usage?.inputTokens, 5);
   assert.equal(jsonSpan.usage?.outputTokens, 6);
   assert.equal(jsonSpan.usage?.totalTokens, 11);
+
+  const retryBodies: string[] = [];
+  let retryAttempt = 0;
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    retryBodies.push(String(init?.body ?? ""));
+    retryAttempt += 1;
+    return new Response(retryAttempt === 1 ? "temporary" : "accepted", {
+      status: retryAttempt === 1 ? 503 : 202,
+    });
+  }) as typeof fetch;
+  const retryPapaya = Papaya.init({
+    apiKey: "papaya-test-token",
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+  });
+  const retryTrace = retryPapaya.startTrace({ workflowKey: "retry-stability" });
+  retryPapaya.finishTrace(retryTrace, "success");
+  const retryFirst = await retryPapaya.flush();
+  const retrySecond = await retryPapaya.flush();
+  assert.equal(retryFirst.status, "failed");
+  assert.equal(retrySecond.status, "sent");
+  assert.equal(retryBodies.length, 2);
+  assert.equal(retryBodies[0], retryBodies[1]);
+  assert.equal(
+    (JSON.parse(retryBodies[0]!) as { batchId?: string }).batchId,
+    (JSON.parse(retryBodies[1]!) as { batchId?: string }).batchId,
+  );
+
+  const splitBodies: Array<{ batchId: string; traceIds: string[] }> = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      batchId: string;
+      traces: Array<{ traceId: string }>;
+    };
+    splitBodies.push({
+      batchId: body.batchId,
+      traceIds: body.traces.map((trace) => trace.traceId),
+    });
+    return new Response(body.traces.length > 1 ? "split" : "accepted", {
+      status: body.traces.length > 1 ? 413 : 202,
+    });
+  }) as typeof fetch;
+  const splitPapaya = Papaya.init({
+    apiKey: "papaya-test-token",
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+    maxBatchBytes: 1024 * 1024,
+  });
+  for (const traceId of ["trace-one", "trace-two", "trace-three"]) {
+    const trace = splitPapaya.startTrace({ traceId, workflowKey: "split-test" });
+    splitPapaya.finishTrace(trace, "success");
+  }
+  const splitResult = await splitPapaya.flush();
+  assert.equal(splitResult.status, "sent");
+  assert.equal(splitResult.traceCount, 3);
+  assert.deepEqual(splitBodies.map((batch) => batch.traceIds), [
+    ["trace-one", "trace-two", "trace-three"],
+    ["trace-one", "trace-two"],
+    ["trace-one"],
+    ["trace-two"],
+    ["trace-three"],
+  ]);
+  assert.equal(new Set(splitBodies.map((batch) => batch.batchId)).size, splitBodies.length);
+
+  const packedBodies: Array<{ bytes: number; traceIds: string[] }> = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const bodyText = String(init?.body ?? "{}");
+    const body = JSON.parse(bodyText) as { traces: Array<{ traceId: string }> };
+    packedBodies.push({
+      bytes: Buffer.byteLength(bodyText),
+      traceIds: body.traces.map((trace) => trace.traceId),
+    });
+    return new Response("accepted", { status: 202 });
+  }) as typeof fetch;
+  const maxBatchBytes = 1_200;
+  const packedPapaya = Papaya.init({
+    apiKey: "papaya-test-token",
+    endpoint: "https://papaya.example/api/v1/ingest/traces",
+    maxBatchBytes,
+  });
+  for (const traceId of ["packed-one", "packed-two", "packed-three"]) {
+    const trace = packedPapaya.startTrace(
+      { traceId, workflowKey: "exact-byte-pack" },
+      { inputValue: { text: "x".repeat(400) } },
+    );
+    packedPapaya.finishTrace(trace, "success");
+  }
+  const packedResult = await packedPapaya.flush();
+  assert.equal(packedResult.status, "sent");
+  assert.ok(packedBodies.length > 1);
+  assert.equal(
+    packedBodies.every((body) => body.bytes <= maxBatchBytes || body.traceIds.length === 1),
+    true,
+  );
+  assert.deepEqual(packedBodies.flatMap((body) => body.traceIds), [
+    "packed-one",
+    "packed-two",
+    "packed-three",
+  ]);
 
   console.log("papaya-ai SDK tests passed");
 } finally {

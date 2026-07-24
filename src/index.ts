@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 
 export type CaptureMode = "metadata" | "redacted" | "full";
 export type SpanStatus = "success" | "failed" | "partial" | "unknown";
@@ -13,13 +13,24 @@ export type PapayaOptions = RunOptions & {
   capture?: CaptureMode;
   serviceName?: string;
   serviceVersion?: string;
+  maxBatchBytes?: number;
   debug?: boolean;
 };
 
 export type PapayaFlushResult =
   | { status: "sent"; traceCount: number; endpoint: string; httpStatus: number; responseText?: string }
   | { status: "skipped"; traceCount: number; reason: "empty" | "missing_api_key" }
-  | { status: "failed"; traceCount: number; endpoint: string; httpStatus?: number; responseText?: string; error?: string };
+  | {
+    status: "failed";
+    traceCount: number;
+    endpoint: string;
+    httpStatus?: number;
+    responseText?: string;
+    error?: string;
+    errorName?: string;
+    errorCode?: string;
+    errorCause?: string;
+  };
 
 export type NativeFetch = typeof globalThis.fetch;
 export type FetchInput = Parameters<NativeFetch>[0];
@@ -105,6 +116,7 @@ export type PapayaStartTraceOptions = {
   rootName?: string;
   rootKind?: SpanKind;
   inputValue?: unknown;
+  inputPayload?: PapayaPayloadRef;
   modelRef?: TraceSpan["modelRef"];
   attributes?: Record<string, unknown>;
   startedAt?: string;
@@ -117,6 +129,7 @@ export type PapayaStartSpanOptions = {
   name: string;
   kind: SpanKind;
   inputValue?: unknown;
+  inputPayload?: PapayaPayloadRef;
   modelRef?: TraceSpan["modelRef"];
   attributes?: Record<string, unknown>;
   startedAt?: string;
@@ -124,6 +137,7 @@ export type PapayaStartSpanOptions = {
 
 export type PapayaFinishSpanOptions = {
   outputValue?: unknown;
+  outputPayload?: PapayaPayloadRef;
   usage?: TraceSpan["usage"];
   modelUsed?: string;
   error?: unknown;
@@ -149,13 +163,42 @@ type TraceBatch = {
   traces: Array<ActiveRun & { rootSpanId: string }>;
 };
 
-const SDK_VERSION = "0.1.0";
+type PendingBatch = {
+  batch: TraceBatch;
+  body: string;
+};
+
+const SDK_VERSION = "0.1.2";
+const DEFAULT_MAX_BATCH_BYTES = 512 * 1024;
 
 const storage = new AsyncLocalStorage<ActiveRun>();
 
 const iso = (): string => new Date().toISOString();
 
-const id = (prefix: string): string => `${prefix}_${randomUUID()}`;
+const id = (prefix: string): string => `${prefix}_${randomBytes(16).toString("base64url")}`;
+
+const jsonableValue = (value: unknown, seen = new WeakSet<object>()): unknown => {
+  if (value === undefined || value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "bigint") return value.toString();
+  if (Array.isArray(value)) return value.map((item) => jsonableValue(item, seen));
+  if (typeof value !== "object") return String(value);
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  try {
+    const toJSON = (value as { toJSON?: unknown }).toJSON;
+    if (typeof toJSON === "function") {
+      try {
+        const serialized = toJSON.call(value) as unknown;
+        if (serialized !== value) return jsonableValue(serialized, seen);
+      } catch {
+        // Fall through to enumerable runtime fields.
+      }
+    }
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, jsonableValue(item, seen)]));
+  } finally {
+    seen.delete(value);
+  }
+};
 
 const redactString = (value: string): string =>
   value
@@ -187,10 +230,11 @@ const byteLength = (value: unknown): number => {
 };
 
 const payload = (value: unknown, capture: CaptureMode): PayloadRef => {
+  const normalized = jsonableValue(value);
   if (capture === "metadata") {
-    return { contentType: contentTypeFor(value), redactionState: "metadata", byteLength: byteLength(value) };
+    return { contentType: contentTypeFor(normalized), redactionState: "metadata", byteLength: byteLength(normalized) };
   }
-  const captured = capture === "redacted" ? redactValue(value) : value;
+  const captured = capture === "redacted" ? redactValue(normalized) : normalized;
   return {
     contentType: contentTypeFor(captured),
     value: captured,
@@ -204,10 +248,47 @@ const errorPayload = (error: unknown): TraceSpan["error"] => {
   return { message: String(error) };
 };
 
+const errorStringProp = (value: unknown, key: string): string | undefined => {
+  if (!value || typeof value !== "object" || !(key in value)) return undefined;
+  const raw = (value as Record<string, unknown>)[key];
+  return typeof raw === "string" && raw.trim() ? raw : undefined;
+};
+
+const flushErrorDetails = (error: unknown): Pick<Extract<PapayaFlushResult, { status: "failed" }>, "error" | "errorName" | "errorCode" | "errorCause"> => {
+  if (!(error instanceof Error)) return { error: String(error) };
+  const cause = (error as { cause?: unknown }).cause;
+  const causeMessage = cause instanceof Error
+    ? cause.message
+    : typeof cause === "string" && cause.trim()
+      ? cause
+      : undefined;
+  return {
+    error: error.message,
+    errorName: error.name,
+    errorCode: errorStringProp(error, "code") ?? errorStringProp(cause, "code"),
+    errorCause: causeMessage && causeMessage !== error.message ? causeMessage : undefined,
+  };
+};
+
 const modelFromArgs = (args: unknown[]): string | undefined => {
   const first = args[0];
   if (first && typeof first === "object" && "model" in first && typeof (first as { model?: unknown }).model === "string") {
     return (first as { model: string }).model;
+  }
+  if (first && typeof first === "object" && "modelId" in first && typeof (first as { modelId?: unknown }).modelId === "string") {
+    return (first as { modelId: string }).modelId;
+  }
+  if (first && typeof first === "object" && "modelVersion" in first && typeof (first as { modelVersion?: unknown }).modelVersion === "string") {
+    return (first as { modelVersion: string }).modelVersion;
+  }
+  if (first && typeof first === "object" && "input" in first) {
+    const commandInput = (first as { input?: unknown }).input;
+    if (commandInput && typeof commandInput === "object" && "modelId" in commandInput && typeof (commandInput as { modelId?: unknown }).modelId === "string") {
+      return (commandInput as { modelId: string }).modelId;
+    }
+    if (commandInput && typeof commandInput === "object" && "model" in commandInput && typeof (commandInput as { model?: unknown }).model === "string") {
+      return (commandInput as { model: string }).model;
+    }
   }
   return undefined;
 };
@@ -410,6 +491,8 @@ export class Papaya {
   private readonly options: Required<Pick<PapayaOptions, "endpoint" | "capture" | "project" | "environment">> & Omit<PapayaOptions, "endpoint" | "capture" | "project" | "environment">;
   private readonly defaultRunOptions: RunOptions;
   private readonly completed: ActiveRun[] = [];
+  private readonly pendingBatches: PendingBatch[] = [];
+  private flushInFlight?: Promise<PapayaFlushResult>;
 
   private constructor(options: PapayaOptions = {}) {
     const {
@@ -420,6 +503,7 @@ export class Papaya {
       environment,
       serviceName,
       serviceVersion,
+      maxBatchBytes,
       debug,
       ...runDefaults
     } = options;
@@ -431,6 +515,9 @@ export class Papaya {
       environment: environment ?? "development",
       serviceName,
       serviceVersion,
+      maxBatchBytes: typeof maxBatchBytes === "number" && maxBatchBytes > 0
+        ? Math.trunc(maxBatchBytes)
+        : DEFAULT_MAX_BATCH_BYTES,
       debug,
     };
     this.defaultRunOptions = runOptionsFrom(runDefaults) ?? {};
@@ -438,6 +525,10 @@ export class Papaya {
 
   static init(options: PapayaOptions = {}): Papaya {
     return new Papaya(options);
+  }
+
+  capturePayload(value: unknown): PapayaPayloadRef {
+    return payload(value, this.options.capture);
   }
 
   async run<T>(options: RunOptions, fn: () => T | Promise<T>): Promise<T> {
@@ -474,7 +565,11 @@ export class Papaya {
       kind: options.kind,
       startedAt: options.startedAt ?? iso(),
       status: "unknown",
-      ...(options.inputValue !== undefined ? { inputPayload: payload(options.inputValue, this.options.capture) } : {}),
+      ...(options.inputPayload
+        ? { inputPayload: options.inputPayload }
+        : options.inputValue !== undefined
+          ? { inputPayload: payload(options.inputValue, this.options.capture) }
+          : {}),
       ...(options.modelRef ? { modelRef: options.modelRef } : {}),
       ...(options.attributes ? { attributes: options.attributes } : {}),
     };
@@ -485,7 +580,8 @@ export class Papaya {
   finishSpan(span: PapayaTraceSpan, status: SpanStatus, options: PapayaFinishSpanOptions = {}): void {
     span.endedAt = options.endedAt ?? iso();
     span.status = status;
-    if (options.outputValue !== undefined) span.outputPayload = payload(options.outputValue, this.options.capture);
+    if (options.outputPayload) span.outputPayload = options.outputPayload;
+    else if (options.outputValue !== undefined) span.outputPayload = payload(options.outputValue, this.options.capture);
     if (options.usage) span.usage = compactRecord(options.usage) as TraceSpan["usage"];
     if (options.modelUsed) span.modelRef = { ...span.modelRef, used: options.modelUsed };
     if (options.error !== undefined) span.error = errorPayload(options.error);
@@ -521,9 +617,16 @@ export class Papaya {
   }
 
   async flush(): Promise<PapayaFlushResult> {
-    if (this.completed.length === 0) return { status: "skipped", traceCount: 0, reason: "empty" };
-    const traces = this.completed.splice(0, this.completed.length);
-    const traceCount = traces.length;
+    if (this.flushInFlight) return this.flushInFlight;
+    this.flushInFlight = this.flushPending();
+    try {
+      return await this.flushInFlight;
+    } finally {
+      this.flushInFlight = undefined;
+    }
+  }
+
+  private newBatch(traces: ActiveRun[]): PendingBatch {
     const batch: TraceBatch = {
       schemaVersion: "2026-06-05",
       batchId: id("batch"),
@@ -541,39 +644,108 @@ export class Papaya {
       },
       traces,
     };
+    return { batch, body: JSON.stringify(batch) };
+  }
 
+  private freezeCompletedBatches(): void {
+    if (this.completed.length === 0) return;
+    let current: ActiveRun[] = [];
+    for (const trace of this.completed.splice(0, this.completed.length)) {
+      const candidate = this.newBatch([...current, trace]);
+      if (current.length > 0 && Buffer.byteLength(candidate.body) > (this.options.maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES)) {
+        this.pendingBatches.push(this.newBatch(current));
+        current = [trace];
+      } else {
+        current.push(trace);
+      }
+    }
+    if (current.length > 0) this.pendingBatches.push(this.newBatch(current));
+  }
+
+  private splitPendingBatch(index: number, pending: PendingBatch): void {
+    const midpoint = Math.ceil(pending.batch.traces.length / 2);
+    const left = this.newBatch(pending.batch.traces.slice(0, midpoint));
+    const right = this.newBatch(pending.batch.traces.slice(midpoint));
+    this.pendingBatches.splice(index, 1, left, right);
+  }
+
+  private async flushPending(): Promise<PapayaFlushResult> {
+    this.freezeCompletedBatches();
+    const traceCount = this.pendingBatches.reduce((sum, pending) => sum + pending.batch.traces.length, 0);
+    if (traceCount === 0) return { status: "skipped", traceCount: 0, reason: "empty" };
     if (!this.options.apiKey) {
       if (this.options.debug) console.warn("[papaya] export skipped: missing PAPAYA_API_KEY");
-      this.completed.unshift(...traces);
       return { status: "skipped", traceCount, reason: "missing_api_key" };
     }
 
-    try {
-      const response = await fetch(this.options.endpoint, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.options.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(batch),
-      });
-      const responseText = await response.text();
-      if (!response.ok && this.options.debug) {
-        console.warn(`[papaya] export failed: ${response.status} ${responseText}`);
+    let lastHttpStatus = 202;
+    let lastResponseText: string | undefined;
+    let index = 0;
+    while (index < this.pendingBatches.length) {
+      const pending = this.pendingBatches[index]!;
+      try {
+        const response = await fetch(this.options.endpoint, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.options.apiKey}`,
+            "Content-Type": "application/json",
+            "User-Agent": `@papaya-ai/tracing/${SDK_VERSION}`,
+          },
+          body: pending.body,
+        });
+        const responseText = await response.text();
+        if (response.ok) {
+          lastHttpStatus = response.status;
+          lastResponseText = responseText;
+          this.pendingBatches.splice(index, 1);
+          continue;
+        }
+        if (response.status === 413 && pending.batch.traces.length > 1) {
+          this.splitPendingBatch(index, pending);
+          continue;
+        }
+        if (response.status === 413) {
+          this.pendingBatches.splice(index, 1);
+          return {
+            status: "failed",
+            traceCount: 1,
+            endpoint: this.options.endpoint,
+            httpStatus: response.status,
+            responseText,
+            error: "The trace exceeds the server's single-trace limit.",
+            errorCode: "oversized_trace",
+          };
+        }
+        const terminal = [400, 401, 403, 409].includes(response.status);
+        if (terminal) this.pendingBatches.splice(index, 1);
+        if (this.options.debug) {
+          console.warn(`[papaya] export failed: ${response.status} ${responseText}`);
+        }
+        return {
+          status: "failed",
+          traceCount: pending.batch.traces.length,
+          endpoint: this.options.endpoint,
+          httpStatus: response.status,
+          responseText,
+          errorCode: terminal ? `http_${response.status}` : "retryable_http_error",
+        };
+      } catch (error) {
+        if (this.options.debug) console.warn("[papaya] export failed", error);
+        return {
+          status: "failed",
+          traceCount: pending.batch.traces.length,
+          endpoint: this.options.endpoint,
+          ...flushErrorDetails(error),
+        };
       }
-      if (!response.ok) {
-        return { status: "failed", traceCount, endpoint: this.options.endpoint, httpStatus: response.status, responseText };
-      }
-      return { status: "sent", traceCount, endpoint: this.options.endpoint, httpStatus: response.status, responseText };
-    } catch (error) {
-      if (this.options.debug) console.warn("[papaya] export failed", error);
-      return {
-        status: "failed",
-        traceCount,
-        endpoint: this.options.endpoint,
-        error: error instanceof Error ? error.message : String(error),
-      };
     }
+    return {
+      status: "sent",
+      traceCount,
+      endpoint: this.options.endpoint,
+      httpStatus: lastHttpStatus,
+      responseText: lastResponseText,
+    };
   }
 
   private wrapClient<T extends object>(provider: string, client: T, path: string[] = [], wrapperOptions?: RunOptions): T {
@@ -721,7 +893,11 @@ export class Papaya {
         kind: startOptions.rootKind ?? "workflow",
         startedAt: startOptions.startedAt ?? iso(),
         status: "unknown",
-        ...(startOptions.inputValue !== undefined ? { inputPayload: payload(startOptions.inputValue, this.options.capture) } : {}),
+        ...(startOptions.inputPayload
+          ? { inputPayload: startOptions.inputPayload }
+          : startOptions.inputValue !== undefined
+            ? { inputPayload: payload(startOptions.inputValue, this.options.capture) }
+            : {}),
         ...(startOptions.modelRef ? { modelRef: startOptions.modelRef } : {}),
         attributes: {
           project: this.options.project,
@@ -738,7 +914,11 @@ export class Papaya {
       ...run.spans[0]!,
       endedAt: options.endedAt ?? iso(),
       status,
-      ...(options.outputValue !== undefined ? { outputPayload: payload(options.outputValue, this.options.capture) } : {}),
+      ...(options.outputPayload
+        ? { outputPayload: options.outputPayload }
+        : options.outputValue !== undefined
+          ? { outputPayload: payload(options.outputValue, this.options.capture) }
+          : {}),
       ...(options.usage ? { usage: compactRecord(options.usage) as TraceSpan["usage"] } : {}),
       ...(options.modelUsed ? { modelRef: { ...run.spans[0]?.modelRef, used: options.modelUsed } } : {}),
       ...(error !== undefined ? { error: errorPayload(error) } : {}),

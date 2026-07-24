@@ -101,6 +101,85 @@ class PapayaCoreTest(unittest.TestCase):
         self.assertEqual(second["status"], "sent")
         self.assertEqual(second["traceCount"], 1)
         self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(calls[0]["batchId"], calls[1]["batchId"])
+
+    def test_413_splits_multi_trace_batches_without_changing_trace_ids(self):
+        calls = []
+
+        def transport(endpoint, headers, body):
+            batch = json.loads(body.decode("utf-8"))
+            calls.append({
+                "batchId": batch["batchId"],
+                "traceIds": [trace["traceId"] for trace in batch["traces"]],
+            })
+            if len(batch["traces"]) > 1:
+                return 413, '{"error":"too_large"}'
+            return 202, '{"accepted":1,"rejected":0}'
+
+        papaya = Papaya.init(
+            api_key="papaya-test-token",
+            endpoint="https://papaya.example/api/v1/ingest/traces",
+            max_batch_bytes=1024 * 1024,
+            transport=transport,
+        )
+        for trace_id in ("trace-one", "trace-two", "trace-three"):
+            trace = papaya.start_trace({"traceId": trace_id, "workflowKey": "split-test"})
+            papaya.finish_trace(trace, "success")
+
+        result = papaya.flush()
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["traceCount"], 3)
+        self.assertEqual(
+            [call["traceIds"] for call in calls],
+            [
+                ["trace-one", "trace-two", "trace-three"],
+                ["trace-one", "trace-two"],
+                ["trace-one"],
+                ["trace-two"],
+                ["trace-three"],
+            ],
+        )
+        self.assertEqual(len({call["batchId"] for call in calls}), len(calls))
+
+    def test_exact_byte_packing_keeps_batches_under_target(self):
+        calls = []
+
+        def transport(endpoint, headers, body):
+            batch = json.loads(body.decode("utf-8"))
+            calls.append({
+                "bytes": len(body),
+                "traceIds": [trace["traceId"] for trace in batch["traces"]],
+            })
+            return 202, '{"accepted":1,"rejected":0}'
+
+        max_batch_bytes = 1_200
+        papaya = Papaya.init(
+            api_key="papaya-test-token",
+            endpoint="https://papaya.example/api/v1/ingest/traces",
+            max_batch_bytes=max_batch_bytes,
+            transport=transport,
+        )
+        for trace_id in ("packed-one", "packed-two", "packed-three"):
+            trace = papaya.start_trace(
+                {"traceId": trace_id, "workflowKey": "exact-byte-pack"},
+                input_value={"text": "x" * 400},
+            )
+            papaya.finish_trace(trace, "success")
+
+        result = papaya.flush()
+
+        self.assertEqual(result["status"], "sent")
+        self.assertGreater(len(calls), 1)
+        self.assertTrue(all(
+            call["bytes"] <= max_batch_bytes or len(call["traceIds"]) == 1
+            for call in calls
+        ))
+        self.assertEqual(
+            [trace_id for call in calls for trace_id in call["traceIds"]],
+            ["packed-one", "packed-two", "packed-three"],
+        )
 
 
 if __name__ == "__main__":

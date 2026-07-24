@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+import base64
 import contextvars
 import inspect
 import json
 import os
 import platform
 import re
+import secrets
 import sys
+import threading
 import urllib.error
 import urllib.request
 from contextlib import AbstractContextManager
 from datetime import datetime, timezone
 from typing import Any, Callable, Literal
-from uuid import uuid4
-
 from .version import __version__
 
 CaptureMode = Literal["metadata", "redacted", "full"]
@@ -45,11 +46,44 @@ def _iso() -> str:
 
 
 def _id(prefix: str) -> str:
-    return f"{prefix}_{uuid4()}"
+    encoded = base64.urlsafe_b64encode(secrets.token_bytes(16)).decode("ascii").rstrip("=")
+    return f"{prefix}_{encoded}"
 
 
 def _json_default(value: Any) -> str:
     return str(value)
+
+
+def _jsonable(value: Any, seen: set[int] | None = None) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    seen = seen or set()
+    marker = id(value)
+    if marker in seen:
+        return "[Circular]"
+    seen.add(marker)
+    try:
+        if isinstance(value, dict):
+            return {str(key): _jsonable(item, seen) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [_jsonable(item, seen) for item in value]
+        for method in ("model_dump", "dict", "to_dict"):
+            fn = getattr(value, method, None)
+            if not callable(fn):
+                continue
+            try:
+                if method == "model_dump":
+                    return _jsonable(fn(serialize_as_any=True), seen)
+                return _jsonable(fn(), seen)
+            except TypeError:
+                if method == "model_dump":
+                    try:
+                        return _jsonable(fn(), seen)
+                    except TypeError:
+                        pass
+        return str(value)
+    finally:
+        seen.remove(marker)
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -103,13 +137,14 @@ def _content_type(value: Any) -> str:
 
 
 def _payload(value: Any, capture: CaptureMode) -> dict[str, Any]:
+    normalized = _jsonable(value)
     if capture == "metadata":
         return {
-            "contentType": _content_type(value),
+            "contentType": _content_type(normalized),
             "redactionState": "metadata",
-            "byteLength": _byte_length(value),
+            "byteLength": _byte_length(normalized),
         }
-    captured = _redact_value(value) if capture == "redacted" else value
+    captured = _redact_value(normalized) if capture == "redacted" else normalized
     return {
         "contentType": _content_type(captured),
         "value": captured,
@@ -204,9 +239,9 @@ def _usage_from_record(value: Any) -> dict[str, Any] | None:
     )
     if usage is None:
         usage = value
-    input_tokens = _number_value(_value_get(usage, "input_tokens", "prompt_tokens", "inputTokens", "promptTokenCount"))
-    output_tokens = _number_value(_value_get(usage, "output_tokens", "completion_tokens", "outputTokens", "candidatesTokenCount"))
-    total_tokens = _number_value(_value_get(usage, "total_tokens", "totalTokens", "totalTokenCount"))
+    input_tokens = _number_value(_value_get(usage, "input_tokens", "prompt_tokens", "inputTokens", "promptTokenCount", "prompt_token_count"))
+    output_tokens = _number_value(_value_get(usage, "output_tokens", "completion_tokens", "outputTokens", "candidatesTokenCount", "candidates_token_count"))
+    total_tokens = _number_value(_value_get(usage, "total_tokens", "totalTokens", "totalTokenCount", "total_token_count"))
     if input_tokens is None and output_tokens is None and total_tokens is None:
         return None
     cost_usd = _number_value(_value_get(usage, "cost_usd", "costUsd"))
@@ -214,9 +249,9 @@ def _usage_from_record(value: Any) -> dict[str, Any] | None:
         "inputTokens": input_tokens,
         "outputTokens": output_tokens,
         "totalTokens": total_tokens if total_tokens is not None else (input_tokens or 0) + (output_tokens or 0),
-        "cacheReadInputTokens": _number_value(_value_get(usage, "cache_read_input_tokens", "cached_input_tokens", "cacheReadInputTokens")),
+        "cacheReadInputTokens": _number_value(_value_get(usage, "cache_read_input_tokens", "cached_input_tokens", "cacheReadInputTokens", "cached_content_token_count")),
         "cacheCreationInputTokens": _number_value(_value_get(usage, "cache_creation_input_tokens", "cacheCreationInputTokens")),
-        "reasoningTokens": _number_value(_value_get(usage, "reasoning_tokens", "reasoningTokens")),
+        "reasoningTokens": _number_value(_value_get(usage, "reasoning_tokens", "reasoningTokens", "thoughts_token_count")),
         "costUsd": cost_usd,
         "pricingSource": "provider" if cost_usd is not None else None,
     }
@@ -267,7 +302,7 @@ def _model_from_result(value: Any, seen: set[int] | None = None) -> str | None:
     if id(value) in seen:
         return None
     seen.add(id(value))
-    model = _value_get(value, "model", "model_name", "modelName", "model_id", "modelId")
+    model = _value_get(value, "model", "model_name", "modelName", "model_id", "modelId", "model_version", "modelVersion")
     if isinstance(model, str) and model:
         return model
     children: list[Any] = []
@@ -374,6 +409,7 @@ class Papaya:
         capture: CaptureMode = "redacted",
         service_name: str | None = None,
         service_version: str | None = None,
+        max_batch_bytes: int = 512 * 1024,
         debug: bool = False,
         transport: Transport | None = None,
         metadata: dict[str, Any] | None = None,
@@ -385,10 +421,13 @@ class Papaya:
         self.capture = capture
         self.service_name = service_name
         self.service_version = service_version
+        self.max_batch_bytes = max_batch_bytes if max_batch_bytes > 0 else 512 * 1024
         self.debug = debug
         self.transport = transport or _default_transport
         self.default_run_options = {"metadata": metadata} if metadata else {}
         self._completed: list[dict[str, Any]] = []
+        self._pending_batches: list[dict[str, Any]] = []
+        self._flush_lock = threading.Lock()
 
     @classmethod
     def init(cls, **options: Any) -> "Papaya":
@@ -396,6 +435,9 @@ class Papaya:
 
     def run(self, options: dict[str, Any] | None = None, **kwargs: Any) -> _RunScope:
         return _RunScope(self, _merge_options(self.default_run_options, options, kwargs))
+
+    def capture_payload(self, value: Any) -> dict[str, Any]:
+        return _payload(value, self.capture)
 
     def wrap_client(self, provider: str, client: Any, options: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         return _PapayaClientProxy(self, provider, client, options=_merge_options(options, kwargs))
@@ -423,6 +465,8 @@ class Papaya:
         root_name: str | None = None,
         root_kind: SpanKind = "workflow",
         input_value: Any | None = None,
+        input_payload: dict[str, Any] | None = None,
+        model_ref: dict[str, Any] | None = None,
         attributes: dict[str, Any] | None = None,
         started_at: str | None = None,
     ) -> dict[str, Any]:
@@ -443,8 +487,12 @@ class Papaya:
                 **(attributes or {}),
             },
         }
-        if input_value is not None:
+        if input_payload is not None:
+            root_span["inputPayload"] = input_payload
+        elif input_value is not None:
             root_span["inputPayload"] = _payload(input_value, self.capture)
+        if model_ref:
+            root_span["modelRef"] = model_ref
         trace = {
             **merged,
             "traceId": trace_id,
@@ -460,14 +508,23 @@ class Papaya:
         status: SpanStatus,
         *,
         output_value: Any | None = None,
+        output_payload: dict[str, Any] | None = None,
+        usage: dict[str, Any] | None = None,
+        model_used: str | None = None,
         error: BaseException | Any | None = None,
         ended_at: str | None = None,
     ) -> None:
         root = trace["spans"][0]
         root["endedAt"] = ended_at or _iso()
         root["status"] = status
-        if output_value is not None:
+        if output_payload is not None:
+            root["outputPayload"] = output_payload
+        elif output_value is not None:
             root["outputPayload"] = _payload(output_value, self.capture)
+        if usage:
+            root["usage"] = {key: value for key, value in usage.items() if value is not None}
+        if model_used:
+            root["modelRef"] = {**root.get("modelRef", {}), "used": model_used}
         if error is not None:
             root["error"] = _error_payload(error)
         if trace not in self._completed:
@@ -482,6 +539,7 @@ class Papaya:
         parent_span_id: str | None = None,
         span_id: str | None = None,
         input_value: Any | None = None,
+        input_payload: dict[str, Any] | None = None,
         model_ref: dict[str, Any] | None = None,
         attributes: dict[str, Any] | None = None,
         started_at: str | None = None,
@@ -498,7 +556,9 @@ class Papaya:
             "startedAt": started_at or _iso(),
             "status": "unknown",
         }
-        if input_value is not None:
+        if input_payload is not None:
+            span["inputPayload"] = input_payload
+        elif input_value is not None:
             span["inputPayload"] = _payload(input_value, self.capture)
         if model_ref:
             span["modelRef"] = model_ref
@@ -618,6 +678,7 @@ class Papaya:
         status: SpanStatus,
         *,
         output_value: Any | None = None,
+        output_payload: dict[str, Any] | None = None,
         usage: dict[str, Any] | None = None,
         model_used: str | None = None,
         error: BaseException | Any | None = None,
@@ -625,7 +686,9 @@ class Papaya:
     ) -> None:
         span["endedAt"] = ended_at or _iso()
         span["status"] = status
-        if output_value is not None:
+        if output_payload is not None:
+            span["outputPayload"] = output_payload
+        elif output_value is not None:
             span["outputPayload"] = _payload(output_value, self.capture)
         if usage:
             span["usage"] = {key: value for key, value in usage.items() if value is not None}
@@ -634,11 +697,7 @@ class Papaya:
         if error is not None:
             span["error"] = _error_payload(error)
 
-    def flush(self) -> dict[str, Any]:
-        if not self._completed:
-            return {"status": "skipped", "traceCount": 0, "reason": "empty"}
-        traces = self._completed[:]
-        self._completed.clear()
+    def _new_pending_batch(self, traces: list[dict[str, Any]]) -> dict[str, Any]:
         batch = {
             "schemaVersion": "2026-06-05",
             "batchId": _id("batch"),
@@ -656,44 +715,104 @@ class Papaya:
             },
             "traces": traces,
         }
+        return {"batch": batch, "body": _json_bytes(batch)}
+
+    def _freeze_completed_batches(self) -> None:
+        if not self._completed:
+            return
+        current: list[dict[str, Any]] = []
+        traces = self._completed[:]
+        self._completed.clear()
+        for trace in traces:
+            candidate = self._new_pending_batch([*current, trace])
+            if current and len(candidate["body"]) > self.max_batch_bytes:
+                self._pending_batches.append(self._new_pending_batch(current))
+                current = [trace]
+            else:
+                current.append(trace)
+        if current:
+            self._pending_batches.append(self._new_pending_batch(current))
+
+    def _split_pending_batch(self, index: int, pending: dict[str, Any]) -> None:
+        traces = pending["batch"]["traces"]
+        midpoint = (len(traces) + 1) // 2
+        self._pending_batches[index:index + 1] = [
+            self._new_pending_batch(traces[:midpoint]),
+            self._new_pending_batch(traces[midpoint:]),
+        ]
+
+    def flush(self) -> dict[str, Any]:
+        with self._flush_lock:
+            return self._flush_pending()
+
+    def _flush_pending(self) -> dict[str, Any]:
+        self._freeze_completed_batches()
+        trace_count = sum(len(pending["batch"]["traces"]) for pending in self._pending_batches)
+        if trace_count == 0:
+            return {"status": "skipped", "traceCount": 0, "reason": "empty"}
         if not self.api_key:
-            self._completed[:0] = traces
-            return {"status": "skipped", "traceCount": len(traces), "reason": "missing_api_key"}
-        body = _json_bytes(batch)
+            return {"status": "skipped", "traceCount": trace_count, "reason": "missing_api_key"}
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "User-Agent": f"papaya-ai-python/{__version__}",
         }
-        try:
-            status, response_text = self.transport(self.endpoint, headers, body)
-        except Exception as error:  # pragma: no cover - defensive transport boundary
-            self._completed[:0] = traces
-            if self.debug:
-                print("[papaya] export failed", error, file=sys.stderr)
-            return {
-                "status": "failed",
-                "traceCount": len(traces),
-                "endpoint": self.endpoint,
-                "error": str(error),
-            }
-        if status < 200 or status >= 300:
-            self._completed[:0] = traces
+        last_status = 202
+        last_response_text: str | None = None
+        index = 0
+        while index < len(self._pending_batches):
+            pending = self._pending_batches[index]
+            pending_trace_count = len(pending["batch"]["traces"])
+            try:
+                status, response_text = self.transport(self.endpoint, headers, pending["body"])
+            except Exception as error:  # pragma: no cover - defensive transport boundary
+                if self.debug:
+                    print("[papaya] export failed", error, file=sys.stderr)
+                return {
+                    "status": "failed",
+                    "traceCount": pending_trace_count,
+                    "endpoint": self.endpoint,
+                    "error": str(error),
+                }
+            if 200 <= status < 300:
+                last_status = status
+                last_response_text = response_text
+                self._pending_batches.pop(index)
+                continue
+            if status == 413 and pending_trace_count > 1:
+                self._split_pending_batch(index, pending)
+                continue
+            if status == 413:
+                self._pending_batches.pop(index)
+                return {
+                    "status": "failed",
+                    "traceCount": 1,
+                    "endpoint": self.endpoint,
+                    "httpStatus": status,
+                    "responseText": response_text,
+                    "error": "The trace exceeds the server's single-trace limit.",
+                    "errorCode": "oversized_trace",
+                }
+            terminal = status in {400, 401, 403, 409}
+            if terminal:
+                self._pending_batches.pop(index)
             if self.debug:
                 print(f"[papaya] export failed: {status} {response_text}", file=sys.stderr)
             return {
                 "status": "failed",
-                "traceCount": len(traces),
+                "traceCount": pending_trace_count,
                 "endpoint": self.endpoint,
                 "httpStatus": status,
                 "responseText": response_text,
+                "errorCode": f"http_{status}" if terminal else "retryable_http_error",
             }
         return {
             "status": "sent",
-            "traceCount": len(traces),
+            "traceCount": trace_count,
             "endpoint": self.endpoint,
-            "httpStatus": status,
-            "responseText": response_text,
+            "httpStatus": last_status,
+            "responseText": last_response_text,
         }
 
 

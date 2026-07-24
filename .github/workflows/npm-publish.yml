@@ -53,11 +53,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
           cache: pip
 
       - name: Install build tools
         run: python -m pip install --upgrade pip build twine
+
+      - name: Install package and provider test contracts
+        run: python -m pip install -e './packages/papaya-ai-python[test]'
 
       - name: Test Python SDK
         run: python -m unittest discover packages/papaya-ai-python/tests
@@ -122,11 +125,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
           cache: pip
 
       - name: Install build tools
         run: python -m pip install --upgrade pip build twine
+
+      - name: Install package and provider test contracts
+        run: python -m pip install -e './packages/papaya-ai-python[test]'
 
       - name: Test Python SDK
         run: python -m unittest discover packages/papaya-ai-python/tests

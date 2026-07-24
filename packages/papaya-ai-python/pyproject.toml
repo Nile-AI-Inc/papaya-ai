@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "papaya-ai"
-version = "0.1.0"
+version = "0.1.2"
 description = "Papaya AI agent trace capture SDK for Python apps."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
 authors = [
   { name = "Nile AI" }
 ]
@@ -18,7 +18,14 @@ dependencies = []
 [project.optional-dependencies]
 openai = ["openai>=1.0"]
 langchain = ["langchain-core>=0.3", "langchain-openai>=0.3"]
-test = []
+test = [
+  "anthropic>=0.40",
+  "boto3>=1.35",
+  "google-genai>=1.0",
+  "langchain-core>=0.3",
+  "langgraph>=0.2",
+  "openai>=1.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

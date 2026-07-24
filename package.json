@@ -1,6 +1,6 @@
 {
   "name": "@papaya-ai/tracing",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Papaya AI agent trace capture SDK for production apps.",
   "license": "MIT",
   "type": "module",
@@ -68,15 +68,20 @@
     "prebuild": "npm run check:node",
     "prepack": "npm run build",
     "pretest": "npm run check:node",
-    "test": "tsx test/sdk.test.ts && tsx test/langchain.test.ts",
+    "test": "node --import tsx test/sdk.test.ts && node --import tsx test/langchain.test.ts && node --import tsx test/provider-matrix.test.ts",
     "pretypecheck": "npm run check:node",
-    "typecheck": "tsc --project tsconfig.json --noEmit"
+    "typecheck": "tsc --project tsconfig.json --noEmit && tsc --project tsconfig.test.json"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.113.0",
+    "@aws-sdk/client-bedrock-runtime": "3.1093.0",
     "@google/genai": "^2.8.0",
     "@langchain/core": "^1.2.0",
+    "@langchain/langgraph": "^1.4.8",
     "@langchain/openai": "^1.5.1",
     "@types/node": "^25.7.0",
+    "ai": "^7.0.35",
+    "openai": "^6.48.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }
